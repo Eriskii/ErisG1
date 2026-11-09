@@ -1,0 +1,21 @@
+[package]
+name = "erisg1"
+description = "Custom software for Even Realities G1 glasses, from your Mac"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Eriskii/ErisG1"
+publish = false
+
+[dependencies]
+btleplug = "0.13.5"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4", features = ["derive"] }
+font8x8 = "0.3"
+futures = "0.3"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+uuid = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
