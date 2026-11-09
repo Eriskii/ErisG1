@@ -191,10 +191,16 @@ const BITMAP_ADDRESS: [u8; 4] = [0x00, 0x1C, 0x00, 0x00];
 /// A full-screen image as a 1-bit BMP file, laid out exactly like the ones in Even's demo: the glasses refuse files
 /// that are two bytes shorter. `lit(x, y)` says which pixels glow; y = 0 is the top row.
 pub fn bitmap(lit: impl Fn(usize, usize) -> bool) -> Vec<u8> {
+    bitmap_rows(HEIGHT, lit)
+}
+
+/// `bitmap` for only the top `rows` rows of the screen, which is less to send. The glasses draw it from the top and
+/// leave the rows below as they were.
+pub fn bitmap_rows(rows: usize, lit: impl Fn(usize, usize) -> bool) -> Vec<u8> {
     const HEADER: u32 = 14 + 40 + 8;
     const TRAILER: u32 = 2;
     let row_bytes = WIDTH.div_ceil(32) * 4;
-    let pixel_bytes = (row_bytes * HEIGHT) as u32;
+    let pixel_bytes = (row_bytes * rows) as u32;
     let mut bmp = Vec::with_capacity((HEADER + pixel_bytes + TRAILER) as usize);
     bmp.extend_from_slice(b"BM");
     bmp.extend_from_slice(&(HEADER + pixel_bytes + TRAILER).to_le_bytes());
@@ -202,7 +208,7 @@ pub fn bitmap(lit: impl Fn(usize, usize) -> bool) -> Vec<u8> {
     bmp.extend_from_slice(&HEADER.to_le_bytes());
     bmp.extend_from_slice(&40u32.to_le_bytes());
     bmp.extend_from_slice(&(WIDTH as i32).to_le_bytes());
-    bmp.extend_from_slice(&(HEIGHT as i32).to_le_bytes());
+    bmp.extend_from_slice(&(rows as i32).to_le_bytes());
     bmp.extend_from_slice(&1u16.to_le_bytes()); // planes
     bmp.extend_from_slice(&1u16.to_le_bytes()); // bits per pixel
     bmp.extend_from_slice(&0u32.to_le_bytes()); // uncompressed
@@ -214,7 +220,7 @@ pub fn bitmap(lit: impl Fn(usize, usize) -> bool) -> Vec<u8> {
     // Colour 0 is lit: the glasses light clear bits whatever the table says.
     bmp.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00]);
     // BMP rows run bottom to top.
-    for y in (0..HEIGHT).rev() {
+    for y in (0..rows).rev() {
         let mut row = vec![0xFFu8; row_bytes];
         for x in 0..WIDTH {
             if lit(x, y) {
@@ -416,6 +422,14 @@ mod tests {
     fn display_round_trip() {
         assert_eq!(display_set(7, true, 9, 3), vec![HARDWARE_SET, 8, 0, 7, 2, 1, DISPLAY_HEIGHT_MAX, 3]);
         assert_eq!(display(&[DISPLAY_GET, ACK, 3, 3]), Some((3, 3)));
+    }
+
+    #[test]
+    fn short_bitmap() {
+        let bmp = bitmap_rows(32, |_, _| false);
+        assert_eq!(bmp.len(), 62 + 72 * 32 + 2);
+        assert_eq!(i32::from_le_bytes(bmp[22..26].try_into().unwrap()), 32);
+        assert_eq!(bitmap_packets(&bmp).0.len(), 13);
     }
 
     #[test]

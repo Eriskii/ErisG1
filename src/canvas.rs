@@ -6,15 +6,21 @@ use crate::proto;
 
 pub struct Canvas {
     lit: Vec<bool>,
+    rows: usize,
 }
 
 impl Canvas {
-    pub fn new() -> Canvas {
-        Canvas { lit: vec![false; proto::WIDTH * proto::HEIGHT] }
+    /// A canvas for only the top `rows` rows of the screen.
+    pub fn with_rows(rows: usize) -> Canvas {
+        Canvas { lit: vec![false; proto::WIDTH * rows], rows }
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows
     }
 
     pub fn set(&mut self, x: usize, y: usize) {
-        if x < proto::WIDTH && y < proto::HEIGHT {
+        if x < proto::WIDTH && y < self.rows {
             self.lit[y * proto::WIDTH + x] = true;
         }
     }
@@ -52,7 +58,7 @@ impl Canvas {
     }
 
     pub fn bmp(&self) -> Vec<u8> {
-        proto::bitmap(|x, y| self.get(x, y))
+        proto::bitmap_rows(self.rows, |x, y| self.get(x, y))
     }
 }
 
@@ -62,7 +68,7 @@ mod tests {
 
     #[test]
     fn text_lands_where_asked() {
-        let mut canvas = Canvas::new();
+        let mut canvas = Canvas::with_rows(proto::HEIGHT);
         canvas.text(10, 20, 2, "|");
         let lit: Vec<(usize, usize)> = (0..proto::HEIGHT)
             .flat_map(|y| (0..proto::WIDTH).map(move |x| (x, y)))
@@ -75,7 +81,7 @@ mod tests {
 
     #[test]
     fn drawing_off_the_edge_is_clipped() {
-        let mut canvas = Canvas::new();
+        let mut canvas = Canvas::with_rows(proto::HEIGHT);
         canvas.text(proto::WIDTH - 4, proto::HEIGHT - 4, 3, "8");
         canvas.fill(proto::WIDTH + 10, 0, 5, 5);
     }

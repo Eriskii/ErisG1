@@ -26,8 +26,8 @@ app or turn the phone's Bluetooth off.
 |---|---|
 | `scan` | List the arms in range |
 | `connect [WHAT] [--down WHAT \| --only-up]` | Show text, a 576×136 1-bit `.bmp`, or `@extents` (a test pattern of the display's edges), optionally a different thing with your head down, and print what the glasses report |
-| `hud` | Clock top left, battery top right, frame counter bottom right, as an image redrawn about every 1.4 s. `--text` sends it as text instead, about 13 times a second, laid out by the glasses |
-| `brightness [0-42] [--auto]` | Read or set the brightness |
+| `hud` | Clock top left, battery top right, frame counter bottom right, as an image redrawn about every 1.4 s. `--scale` sets the text size, `--rows` redraws only that many rows from the top, and `--text` sends it as text instead, about 13 times a second, laid out by the glasses |
+| `brightness [0-42] [--auto]` | Read or set the brightness. Auto brightness doesn't run while an image is up |
 | `head-up [0-60]` | Read or set how far you tilt your head before the glasses count it as up |
 | `display [HEIGHT] [DEPTH]` | Read or set where the picture sits: height 0–8, and depth, how far away it appears |
 | `probe` | Ask both arms everything they answer without changing anything, then show their debug log |
@@ -51,8 +51,12 @@ to explain it:
   upload state on every connection.
 - **Text** stays in the glasses' memory and redraws within a tick, so it's far faster than images, but the
   glasses lay it out in an area left of center and drop spaces at the start of a line.
-- **Display height** only moved the glasses' own screens in our tests, but those ran while the arms were stuck
-  in update mode. The source says it moves images and text as well, in 35-pixel steps.
+- **Display height** moves images and text as well as the glasses' own screens, in 35-pixel steps.
+- **Settings are saved** only once the arms' storage has been left alone for a while: five seconds in the
+  source, about ten in practice. A restart, or images, sooner than that loses the change, so `display` and
+  `brightness` wait 12 s after setting.
+- **Auto brightness** is switched off by the firmware while an image is up, and turning it back on then makes
+  the left arm reject images. Neither arm's light sensor can be read meanwhile.
 - **No raw IMU stream** is known for the G1; it reports head up and head down past an angle you set.
 - Gadgetbridge found the glasses drop the connection after about 30 s of silence, so `erisg1` sends a status
   read every 8 s.

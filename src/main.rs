@@ -16,6 +16,10 @@ use proto::{Event, Side};
 /// The glasses drop the link after about 30 seconds of silence.
 const HEARTBEAT: Duration = Duration::from_secs(8);
 
+/// How long to leave the glasses alone after changing a setting, so they save it. Firmware 1.66 waits for five quiet
+/// seconds, but a height change only survived a restart after about ten.
+const SETTINGS_SAVE: Duration = Duration::from_secs(12);
+
 #[derive(Parser)]
 #[command(version, about = "Custom software for Even Realities G1 glasses")]
 struct Cli {
@@ -92,6 +96,13 @@ enum Command {
         /// Stream the glasses' own debug log into this program's output while it runs.
         #[arg(long)]
         firmware_log: bool,
+        /// How big the image's text is: the 8×8 font drawn this many times over.
+        #[arg(long, default_value_t = 3)]
+        scale: usize,
+        /// Draw only this many rows from the top, which is less to send. The rest of the screen keeps whatever was
+        /// there.
+        #[arg(long, default_value_t = proto::HEIGHT)]
+        rows: usize,
         /// How long to wait after each image for it to reach the panel, in milliseconds.
         #[arg(long)]
         draw_ms: Option<u64>,
@@ -110,6 +121,9 @@ enum Command {
         #[arg(value_parser = ["on", "off"])]
         state: String,
     },
+    /// Send one of the firmware's `#` debug commands to both arms and print what comes back.
+    #[command(hide = true)]
+    Debug { command: String },
     /// Ask both arms everything they're known to answer without changing anything, then listen to their debug log
     /// while you move your head.
     Probe {
@@ -152,11 +166,23 @@ async fn main() -> ExitCode {
         Command::Exit { channel } => exit(channel).await,
         Command::Display { height, depth, channel } => display(height, depth, channel).await,
         Command::Reboot { channel } => reboot(channel).await,
-        Command::Hud { interval, text, columns, firmware_log, draw_ms, settle_ms, indent, channel } => {
-            let waits = (draw_ms.map(Duration::from_millis), settle_ms.map(Duration::from_millis));
-            hud(Duration::from_secs_f64(interval), text, columns, firmware_log, waits, indent, channel).await
+        Command::Hud { interval, text, columns, firmware_log, scale, rows, draw_ms, settle_ms, indent, channel } => {
+            hud(HudOptions {
+                interval: Duration::from_secs_f64(interval),
+                text,
+                columns,
+                indent,
+                firmware_log,
+                scale: scale.max(1),
+                rows: rows.clamp(1, proto::HEIGHT),
+                draw: draw_ms.map(Duration::from_millis),
+                settle: settle_ms.map(Duration::from_millis),
+                channel,
+            })
+            .await
         }
         Command::FirmwareLog { state } => firmware_log(state == "on").await,
+        Command::Debug { command } => debug(&command).await,
         Command::Probe { listen, channel } => probe(Duration::from_secs(listen), channel).await,
         Command::Connect { show, down, only_up, channel, raw } => {
             let up = Show::parse(&show);
@@ -320,6 +346,8 @@ async fn brightness(level: Option<u8>, auto: bool, channel: Option<u32>) -> Resu
                 eprintln!("{side}: brightness set got {:?}", reply.map(|r| proto::hex(&r)));
             }
         }
+        println!("saving…");
+        tokio::time::sleep(SETTINGS_SAVE).await;
     }
     // The left arm holds the setting the official app reads.
     let reply = glasses.request(Side::Left, &proto::brightness_get()).await?;
@@ -433,6 +461,10 @@ async fn display(height: Option<u8>, depth: Option<u8>, channel: Option<u32>) ->
         if !(previewed && kept) {
             eprintln!("an arm didn't acknowledge the move");
         }
+        // The arms save settings to flash once nothing has touched their storage for five seconds; anything sent in
+        // that time, or a restart, loses the change.
+        println!("saving…");
+        tokio::time::sleep(SETTINGS_SAVE).await;
     }
     let (height, depth) =
         if height.is_some() { read_display(&mut glasses).await? } else { (current_height, current_depth) };
@@ -452,8 +484,6 @@ async fn reboot(channel: Option<u32>) -> Result<(), Error> {
     Ok(())
 }
 
-/// How big the HUD's text is: 8×8 characters drawn this many times over.
-const HUD_SCALE: usize = 3;
 const HUD_MARGIN: usize = 4;
 /// How often the HUD asks for the battery, on top of the levels the glasses report themselves.
 const HUD_BATTERY_EVERY: Duration = Duration::from_secs(60);
@@ -461,15 +491,21 @@ const HUD_BATTERY_EVERY: Duration = Duration::from_secs(60);
 /// Lines of text on one screen.
 const HUD_TEXT_LINES: usize = 5;
 
-async fn hud(
+struct HudOptions {
     interval: Duration,
     text: bool,
     columns: usize,
-    firmware_log: bool,
-    (draw, settle): (Option<Duration>, Option<Duration>),
     indent: usize,
+    firmware_log: bool,
+    scale: usize,
+    rows: usize,
+    draw: Option<Duration>,
+    settle: Option<Duration>,
     channel: Option<u32>,
-) -> Result<(), Error> {
+}
+
+async fn hud(options: HudOptions) -> Result<(), Error> {
+    let HudOptions { interval, text, columns, indent, firmware_log, scale, rows, draw, settle, channel } = options;
     let adapter = link::adapter().await?;
     let mut glasses = Glasses::connect(&adapter, channel).await?;
     println!("connected to channel {}; Ctrl-C to stop", glasses.channel);
@@ -482,6 +518,10 @@ async fn hud(
     if firmware_log {
         glasses.send(Side::Left, DEBUG_LOG_ON).await?;
         glasses.send(Side::Right, DEBUG_LOG_ON).await?;
+    }
+    if !text && rows < proto::HEIGHT {
+        // The rows below a short image keep what was there, so start from a blank screen.
+        glasses.show_bitmap(&proto::bitmap(|_, _| false)).await?;
     }
     if text {
         // Text draws over a bitmap rather than replacing it.
@@ -531,15 +571,15 @@ async fn hud(
             _ => 0.0,
         };
 
-        let mut canvas = Canvas::new();
-        let line = 8 * HUD_SCALE;
-        canvas.text(HUD_MARGIN, HUD_MARGIN, HUD_SCALE, &chrono::Local::now().format("%H:%M:%S").to_string());
+        let mut canvas = Canvas::with_rows(rows);
+        let line = 8 * scale;
+        canvas.text(HUD_MARGIN, HUD_MARGIN, scale, &chrono::Local::now().format("%H:%M:%S").to_string());
         let percent = |level: Option<u8>| level.map_or("--".into(), |l| l.to_string());
         let power = format!("L{}% R{}%", percent(battery[0]), percent(battery[1]));
-        canvas.text(proto::WIDTH - HUD_MARGIN - Canvas::text_width(&power, HUD_SCALE), HUD_MARGIN, HUD_SCALE, &power);
+        canvas.text(proto::WIDTH - HUD_MARGIN - Canvas::text_width(&power, scale), HUD_MARGIN, scale, &power);
         let counter = format!("#{frames} {rate:.1}/s");
-        let x = proto::WIDTH - HUD_MARGIN - Canvas::text_width(&counter, HUD_SCALE);
-        canvas.text(x, proto::HEIGHT - HUD_MARGIN - line, HUD_SCALE, &counter);
+        let x = proto::WIDTH - HUD_MARGIN - Canvas::text_width(&counter, scale);
+        canvas.text(x, canvas.rows().saturating_sub(HUD_MARGIN + line), scale, &counter);
 
         if let Some(last) = last_sent {
             tokio::time::sleep_until((last + interval).into()).await;
@@ -583,6 +623,20 @@ async fn firmware_log(on: bool) -> Result<(), Error> {
     tokio::time::sleep(Duration::from_millis(300)).await;
     glasses.disconnect().await;
     println!("firmware log {}", if on { "on" } else { "off" });
+    Ok(())
+}
+
+async fn debug(command: &str) -> Result<(), Error> {
+    let adapter = link::adapter().await?;
+    let mut glasses = Glasses::connect(&adapter, None).await?;
+    gather(&mut glasses, Duration::from_millis(500)).await;
+    for side in [Side::Left, Side::Right] {
+        glasses.send(side, command.as_bytes()).await?;
+    }
+    for (side, data) in gather(&mut glasses, Duration::from_secs(2)).await {
+        println!("{} < {}", side.letter(), dump(&data));
+    }
+    glasses.disconnect().await;
     Ok(())
 }
 
