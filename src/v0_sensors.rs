@@ -429,7 +429,14 @@ pub async fn stop(side: Option<Side>) -> Result<(), Error> {
     let mut arms = crate::v0::arms(side).await?;
     for arm in &mut arms {
         arm.control(v5::ctrl::VM_STOP, &[]).await?;
-        arm.run([v5::set(prop::IMU_RATE, 13), v5::set(prop::GYRO_RATE, 0), v5::set(prop::PANEL, 0)]).await?;
+        // The arm-to-arm link off too, which `v0 cube` turns on.
+        arm.run([
+            v5::set(prop::IMU_RATE, 13),
+            v5::set(prop::GYRO_RATE, 0),
+            v5::set(prop::PEER_LINK, 0),
+            v5::set(prop::PANEL, 0),
+        ])
+        .await?;
         arm.flush().await?;
     }
     for arm in arms {

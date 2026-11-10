@@ -83,6 +83,10 @@ redrawn a region at a time, plus the accelerometer, gyroscope, TouchBar and ligh
 | `v0 events` | TouchBar gestures, wear, the case and the battery as they happen |
 | `v0 sensors [--boost N]` | Every sensor reading of both arms, the left arm's in a column on the left and the right's on the right, and a level line, the same in both eyes. Brightness follows the right arm's light sensor, N levels up |
 | `v0 flight [--boost N]` | A mock flight HUD with your head as the controls: tilt up to climb, bank or turn to turn. The arms draw it themselves with a routine built by `src/v5_asm.rs`, from about 110 bytes of state a frame; about 14 frames a second |
+| `v0 cube [--boost N]` | The time with seconds at the top left, the battery (both arms averaged) at the top right, and a wireframe cube spinning in the middle in 3D: each eye gets its own view of it, about 1 m ahead, nearer edges brighter. Runs on the glasses alone, 10 frames a second, until `v0 stop`: a program on each arm keeps the time, reads the battery, follows the light and draws the cube's 48-second loop, and the arms keep in step over their arm-to-arm link. With `--from-mac`, the Mac drives it instead (one view for both eyes, 25–29 frames a second, until Ctrl-C) |
+| `v0 pinned [--boost N] [--rotation-only]` | The 3D cube pinned in the room: the arms' gyroscopes and accelerometers follow the head, so it stays put as you turn (a while: the heading drifts). A tap on a TouchBar brings it back ahead. Following where the head moves, not just its turn, adds little |
+| `v0 extents` | A frame around the whole 640×480 panel with ticks every 16 pixels, the coordinates every 64 and a cross in the middle, until `v0 stop` |
+| `v0 depth` | Boxed rows at seven depths, by how far apart the eyes' copies are (0 to 133 pixels), until `v0 stop` |
 | `v0 stop` | Stop any program running on the arms and switch the panel off |
 | `v0 panel off\|on\|standby`, `v0 brightness [0-42] [--auto]`, `v0 reboot [--clear]` | |
 

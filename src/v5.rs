@@ -189,8 +189,10 @@ pub mod ctrl {
     pub const REBOOT: u8 = 0x08;
     pub const PROPS: u8 = 0x0A;
     pub const PANEL_READ: u8 = 0x0B;
+    pub const ARENA_CRC: u8 = 0x0C;
     pub const VM_START: u8 = 0x10;
     pub const VM_STOP: u8 = 0x11;
+    pub const VM_STATUS: u8 = 0x12;
     pub const EVENTS: u8 = 0x14;
 }
 
@@ -203,10 +205,12 @@ pub fn control(op: u8, tag: u8, body: &[u8]) -> Vec<u8> {
 
 /// Properties (§2.5).
 pub mod prop {
+    pub const TIME_US: u8 = 0x00;
     pub const LINK_INTERVAL: u8 = 0x05;
     pub const BATT_MV: u8 = 0x10;
     pub const BATT_PCT: u8 = 0x11;
     pub const CHARGE: u8 = 0x12;
+    pub const IN_CASE: u8 = 0x13;
     pub const WORN: u8 = 0x14;
     pub const BATT_MA: u8 = 0x15;
     pub const BATT_TEMP: u8 = 0x16;
@@ -218,6 +222,7 @@ pub mod prop {
     pub const ROLL: u8 = 0x1D;
     pub const BRIGHTNESS: u8 = 0x20;
     pub const PANEL: u8 = 0x21;
+    pub const TIMER: u8 = 0x22;
     pub const IMU_RATE: u8 = 0x28;
     pub const BRIGHTNESS_CAP: u8 = 0x2A;
     pub const GYR_X: u8 = 0x30;
@@ -227,13 +232,19 @@ pub mod prop {
     pub const TOUCH_GESTURE: u8 = 0x34;
     pub const AUTO_BRIGHTNESS: u8 = 0x38;
     pub const PEER_LINK: u8 = 0x39;
+    pub const PEER_SEND: u8 = 0x3A;
+    pub const PEER_MSG: u8 = 0x3B;
+    pub const PEER_T_US: u8 = 0x3C;
 }
 
 /// What a property reads when the arm has no value for it.
 pub const UNKNOWN: u32 = 0x8000_0000;
 
-/// Triggers the arm can report as `INPUT` events (§5.2), by bit in the `EVENTS` mask.
+/// Triggers (§5.2): what starts a program's handlers, and what the arm can report as `INPUT` events, by bit in the
+/// `EVENTS` mask.
 pub mod trigger {
+    pub const START: u8 = 0;
+    pub const TIMER: u8 = 1;
     pub const MOTION: u8 = 2;
     pub const TILT: u8 = 3;
     pub const LIGHT: u8 = 4;
@@ -241,6 +252,7 @@ pub mod trigger {
     pub const CASE: u8 = 6;
     pub const WEAR: u8 = 7;
     pub const TOUCH: u8 = 8;
+    pub const PEER: u8 = 9;
 
     pub fn name(id: u8) -> &'static str {
         match id {
@@ -251,6 +263,9 @@ pub mod trigger {
             CASE => "case",
             WEAR => "wear",
             TOUCH => "touch",
+            START => "start",
+            TIMER => "timer",
+            PEER => "peer",
             _ => "?",
         }
     }

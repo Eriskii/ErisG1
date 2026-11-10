@@ -12,7 +12,10 @@ mod mcuboot;
 mod proto;
 mod smp;
 mod v0;
+mod v0_cube;
+mod v0_cube_glasses;
 mod v0_flight;
+mod v0_pinned;
 mod v0_sensors;
 mod v5;
 mod v5_asm;
@@ -242,6 +245,42 @@ enum V0Command {
         #[arg(long, value_parser = ["left", "right"])]
         arm: Option<String>,
     },
+    /// The time with seconds at the top left, the battery (both arms averaged) at the top right, and a wireframe cube
+    /// spinning in the middle. Run by the glasses on their own at 10 frames a second, until `v0 stop`.
+    Cube {
+        /// Levels (of 42) added to the brightness Even's light table gives.
+        #[arg(long, default_value_t = 5)]
+        boost: u8,
+        /// Drive it from the Mac instead, about 150 bytes a frame, at 25–29 frames a second, until Ctrl-C.
+        #[arg(long)]
+        from_mac: bool,
+        #[arg(long, value_parser = ["left", "right"])]
+        arm: Option<String>,
+    },
+    /// The 3D cube, pinned in the room 1 m ahead: the arms' gyroscopes and accelerometers follow your head, so it
+    /// stays put as you turn (for a while). Tap a TouchBar to bring it back in front. Until Ctrl-C.
+    Pinned {
+        /// Levels (of 42) added to the brightness Even's light table gives.
+        #[arg(long, default_value_t = 5)]
+        boost: u8,
+        /// Follow only how the head turns, not where it moves.
+        #[arg(long)]
+        rotation_only: bool,
+        #[arg(long, value_parser = ["left", "right"])]
+        arm: Option<String>,
+    },
+    /// A frame around the whole 640 × 480 panel with ticks every 16 pixels, the coordinates every 64 and a cross in
+    /// the middle, to see how much of it is visible. Stays until `v0 stop`.
+    Extents {
+        #[arg(long, value_parser = ["left", "right"])]
+        arm: Option<String>,
+    },
+    /// Rows of boxed text at different depths, from far at the top to about 0.6 m at the bottom, by how far apart the
+    /// two eyes' copies are. Stays until `v0 stop`.
+    Depth {
+        #[arg(long, value_parser = ["left", "right"])]
+        arm: Option<String>,
+    },
     /// Stop any program running on the arms and switch the panel off.
     Stop {
         #[arg(long, value_parser = ["left", "right"])]
@@ -357,6 +396,11 @@ async fn v0_command(command: V0Command) -> Result<(), Error> {
         V0Command::Hud { scale, arm } => v0::hud(pick(arm), scale).await,
         V0Command::Sensors { boost, arm } => v0_sensors::sensors(pick(arm), boost).await,
         V0Command::Flight { boost, arm } => v0_flight::flight(pick(arm), boost).await,
+        V0Command::Cube { boost, from_mac: true, arm } => v0_cube::cube_hud(pick(arm), boost).await,
+        V0Command::Cube { boost, from_mac: false, arm } => v0_cube_glasses::cube_on_glasses(pick(arm), boost).await,
+        V0Command::Pinned { boost, rotation_only, arm } => v0_pinned::pinned(pick(arm), boost, !rotation_only).await,
+        V0Command::Extents { arm } => v0::extents(pick(arm)).await,
+        V0Command::Depth { arm } => v0::depth(pick(arm)).await,
         V0Command::Stop { arm } => v0_sensors::stop(pick(arm)).await,
         V0Command::Imu { hz, gyro, arm } => v0::imu(pick(arm), hz, gyro).await,
         V0Command::Events { arm } => v0::events(pick(arm)).await,

@@ -476,6 +476,9 @@ pub async fn flight(side: Option<Side>, boost: u8) -> Result<(), Error> {
         writes.extend(v5::upload(LABELS, &tables.labels, max));
         writes.extend(v5::upload(LABEL_TEXT, &tables.text, max));
         writes.push(v5::write(WORK, &[0; WORK_WORDS as usize * 4]));
+        // A blank frame to start from: the ladder's rectangle would otherwise show whatever the last program left.
+        writes.push(v5::fill(0, 0, v5::WIDTH, v5::HEIGHT, 0));
+        writes.push(v5::draw(0, 0, v5::WIDTH, v5::HEIGHT));
         writes.push(v5::set(prop::IMU_RATE, 104));
         writes.push(v5::set(prop::GYRO_RATE, 104));
         arm.run(writes).await?;

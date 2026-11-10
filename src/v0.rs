@@ -222,6 +222,111 @@ pub async fn text(side: Option<Side>, text: &str, scale: u8, x: i32, y: i32) -> 
     Ok(())
 }
 
+/// Where `extents` keeps its do-nothing program.
+const EXTENTS_IDLE: u32 = 0x30000;
+
+/// The panel's edges: a frame around all 640 × 480 pixels, ticks every 16 pixels along each edge (longer every 64,
+/// with the coordinate beside them) and a cross in the middle, to see how much of it is visible. A program that does
+/// nothing keeps the panel on after the Mac leaves, until `v0 stop`.
+pub async fn extents(side: Option<Side>) -> Result<(), Error> {
+    let mut arms = arms(side).await?;
+    for arm in &mut arms {
+        arm.control(v5::ctrl::VM_STOP, &[]).await?;
+        upload_font(arm, 1).await?;
+        arm.run(extents_code()).await?;
+        arm.flush().await?;
+        crate::v0_sensors::start_idle_program(arm, EXTENTS_IDLE).await?;
+    }
+    disconnect(arms).await;
+    println!("showing the panel's edges; `erisg1 v0 stop` clears them");
+    Ok(())
+}
+
+fn extents_code() -> Vec<Vec<u8>> {
+    let (w, h) = (v5::WIDTH as i32, v5::HEIGHT as i32);
+    let mut code = vec![v5::fill(0, 0, v5::WIDTH, v5::HEIGHT, 0), v5::fixed_args()];
+    let mut lines = vec![[0, 0, w - 1, 0], [w - 1, 0, w - 1, h - 1], [w - 1, h - 1, 0, h - 1], [0, h - 1, 0, 0]];
+    let depth = |at: i32| if at % 64 == 0 { 12 } else { 5 };
+    for x in (16..w - 1).step_by(16) {
+        lines.push([x, 0, x, depth(x) - 1]);
+        lines.push([x, h - 1, x, h - depth(x)]);
+    }
+    for y in (16..h - 1).step_by(16) {
+        lines.push([0, y, depth(y) - 1, y]);
+        lines.push([w - 1, y, w - depth(y), y]);
+    }
+    lines.push([w / 2, h / 2 - 10, w / 2, h / 2 + 10]);
+    lines.push([w / 2 - 10, h / 2, w / 2 + 10, h / 2]);
+    code.extend(lines.into_iter().map(|[x0, y0, x1, y1]| v5::line_k(x0, y0, x1, y1, 15)));
+    // The coordinates, 8 pixels high: x below the long ticks at the top and above them at the bottom, y beside them
+    // on the left and the right. Each is drawn by its baseline, 7 pixels below its top.
+    let mut labels: Vec<(i32, i32, String)> = Vec::new();
+    for x in (64..w).step_by(64) {
+        let half = 4 * x.to_string().len() as i32;
+        labels.push((x - half, 14 + 7, x.to_string()));
+        labels.push((x - half, h - 14 - 8 + 7, x.to_string()));
+    }
+    for y in (64..h).step_by(64) {
+        let wide = 8 * y.to_string().len() as i32;
+        labels.push((14, y + 3, y.to_string()));
+        labels.push((w - 14 - wide, y + 3, y.to_string()));
+    }
+    let size = format!("{w} x {h}");
+    labels.push((w / 2 - 4 * size.len() as i32, h / 2 + 30, size));
+    for (x, baseline, text) in labels {
+        let indices = v5::text_indices(&text);
+        code.push(v5::write(v5::TEXT, &indices));
+        code.push(v5::glyphs_k(x, baseline, 15, v5::TEXT, indices.len()));
+    }
+    code.push(v5::draw(0, 0, v5::WIDTH, v5::HEIGHT));
+    code
+}
+
+/// The rows of `depth`: the disparity in pixels, and the distance it stands for on the pair scouter_kit was
+/// calibrated on (100 px at 0.8 m, so 80 / metres).
+const DEPTHS: [(i32, &str); 7] =
+    [(0, "far"), (20, "~4 m"), (40, "~2 m"), (60, "~1.3 m"), (80, "~1 m"), (100, "~0.8 m"), (133, "~0.6 m")];
+
+/// Rows of boxed text, each at its own depth: the left eye's copy moved right and the right eye's left, by
+/// `DEPTHS` between them in all, so the row stays straight ahead and looks nearer the further apart they are.
+/// Stays until `v0 stop`.
+pub async fn depth(side: Option<Side>) -> Result<(), Error> {
+    let mut arms = arms(side).await?;
+    for arm in &mut arms {
+        arm.control(v5::ctrl::VM_STOP, &[]).await?;
+        upload_font(arm, 2).await?;
+        arm.run(depth_code(arm.side)).await?;
+        arm.flush().await?;
+        crate::v0_sensors::start_idle_program(arm, EXTENTS_IDLE).await?;
+    }
+    disconnect(arms).await;
+    println!("showing rows at disparities {:?} px, nearest at the bottom", DEPTHS.map(|d| d.0));
+    Ok(())
+}
+
+fn depth_code(side: Side) -> Vec<Vec<u8>> {
+    const BOX_W: i32 = 320;
+    const BOX_H: i32 = 44;
+    let mut code = vec![v5::fill(0, 0, v5::WIDTH, v5::HEIGHT, 0), v5::fixed_args()];
+    for (i, (disparity, distance)) in DEPTHS.into_iter().enumerate() {
+        let shift = match side {
+            Side::Left => disparity - disparity / 2,
+            Side::Right => -(disparity / 2),
+        };
+        let (x0, y0) = (v5::WIDTH as i32 / 2 - BOX_W / 2 + shift, 20 + i as i32 * 64);
+        let (x1, y1) = (x0 + BOX_W - 1, y0 + BOX_H - 1);
+        for [ax, ay, bx, by] in [[x0, y0, x1, y0], [x1, y0, x1, y1], [x1, y1, x0, y1], [x0, y1, x0, y0]] {
+            code.push(v5::line_k(ax, ay, bx, by, 15));
+        }
+        let text = v5::text_indices(&format!("{disparity} px  {distance}"));
+        let x = v5::WIDTH as i32 / 2 - 8 * text.len() as i32 + shift;
+        code.push(v5::write(v5::TEXT, &text));
+        code.push(v5::glyphs_k(x, y0 + 14 + 14, 15, v5::TEXT, text.len()));
+    }
+    code.push(v5::draw(0, 0, v5::WIDTH, v5::HEIGHT));
+    code
+}
+
 const HUD_MARGIN: i32 = 12;
 /// How often the HUD reads head pitch and roll. The accelerometer gives 13 readings a second unless asked for more.
 const HUD_POSE_EVERY: Duration = Duration::from_millis(150);
