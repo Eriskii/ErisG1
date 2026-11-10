@@ -1,274 +1,237 @@
-//! `erisg1 v0 sensors`: a sensor HUD that runs on the arms themselves. Each arm runs the same program: 25 times a
-//! second it draws a level line from its own accelerometer, and every eighth time its own raw sensor readings, in a
-//! column on its own side of the view (the left arm's on the left), so the two eyes never show different things in
-//! the same place. The Mac only loads it and measures how far the arms' accelerometers disagree, so both lines
-//! match; then it can go away.
+//! `erisg1 v0 sensors`: every sensor reading of both arms and a level line, drawn from the Mac into both eyes alike
+//! over the whole panel. The left arm's readings fill a column on the left and the right arm's a column on the right,
+//! in both eyes; the level line between them comes from both arms' accelerometers averaged. Frames reach both arms
+//! ahead of time with the moment to show them, as `v0 hud`'s do, so the eyes change together.
 
 use std::time::Duration;
 
-use crate::link::Error;
+use crate::link::{self, Error};
 use crate::proto::Side;
 use crate::v5::{self, prop};
-use crate::v5_asm::*;
-use crate::v5_link::{Arm, side_name};
-
-// Where the program keeps things, above the frame and font (v5::FRAME, v5::FONT).
-const POOL: u32 = 0x30000;
-const VARS: u32 = 0x30400;
-const LABELS: u32 = 0x30500;
-const DIGITS: u32 = 0x30700;
-const TABLE: u32 = 0x30800;
-const CODE: u32 = 0x30900;
-
-/// Words in VARS, which the Mac sets per arm before starting the program.
-const FRAMES: u32 = 0;
-const CAL_X: u32 = 1;
-const CAL_Y: u32 = 2;
-const CAL_Z: u32 = 3;
-const COL_X: u32 = 4;
-const COL_R: u32 = 5;
-
-fn var(i: u32) -> u16 {
-    ((VARS / 4) + i) as u16
-}
-
-const R0: u16 = 0;
-const R1: u16 = 1;
-const R2: u16 = 2;
-const R3: u16 = 3;
-const R4: u16 = 4;
-const R5: u16 = 5;
-const R6: u16 = 6;
-const R7: u16 = 7;
-const R8: u16 = 8;
-const R9: u16 = 9;
-const R10: u16 = 10;
-const R11: u16 = 11;
+use crate::v5_link;
 
 const SCALE: u8 = 2;
-const ADVANCE: u32 = 8 * SCALE as u32;
-const ASCENT: u32 = 7 * SCALE as u32;
-const ROW: u32 = ADVANCE + 2;
-const COL_W: u32 = 208;
-const TEXT_Y: u32 = 96;
-/// The level line's box, between the two columns.
-const BOX_X: u32 = 220;
-const BOX_Y: u32 = 140;
-const BOX_W: u32 = 200;
-const BOX_H: u32 = 200;
-const CX: u32 = BOX_X + BOX_W / 2;
-const CY: u32 = BOX_Y + BOX_H / 2;
-/// Pixels the line moves per radian of pitch, and its half length per g of gravity across the view.
-const PITCH_PX: u32 = 480;
-const HALF_LINE: u32 = 90;
-const PERIOD_US: u32 = 40_000;
-const TEXT_EVERY: u32 = 8;
-const MASK: u32 = 2;
+const ADVANCE: i32 = 8 * SCALE as i32;
+const ASCENT: i32 = 7 * SCALE as i32;
+/// 16 rows of 30 pixels fill the 480-line panel.
+const ROW: i32 = 30;
+const TOP: i32 = 8;
+const MARGIN: i32 = 4;
+const COL_W: u32 = 200;
+/// Where values start in a column, after the labels (five characters), and how wide they can be (seven).
+const VALUE_X: i32 = 88;
+const VALUE_W: u32 = COL_W - VALUE_X as u32;
+/// The level line's band between the two columns, the panel's full height.
+const BOX_X: i32 = 210;
+const BOX_W: u32 = 220;
+const CX: i32 = BOX_X + BOX_W as i32 / 2;
+const CY: i32 = v5::HEIGHT as i32 / 2;
+/// Pixels the line moves per radian of pitch (about ±30° fills the panel), and its half length.
+const PITCH_PX: f64 = 460.0;
+const HALF_LINE: f64 = 100.0;
+/// The columns are redrawn every this many frames; the line every frame.
+const TEXT_EVERY: u64 = 4;
+const QUEUE: usize = 4;
+/// The beat frames are shown on.
+const PERIOD: Duration = Duration::from_millis(50);
 
-enum Value {
-    Title,
-    Prop(u8, u32),
-    Frames,
+/// The readings in a column: a label, the property, and the decimals its raw value carries.
+const READINGS: [(&str, u8, u32); 12] = [
+    ("ACC X", prop::ACC_X, 0),
+    ("ACC Y", prop::ACC_Y, 0),
+    ("ACC Z", prop::ACC_Z, 0),
+    ("GYR X", prop::GYR_X, 0),
+    ("GYR Y", prop::GYR_Y, 0),
+    ("GYR Z", prop::GYR_Z, 0),
+    ("PITCH", prop::PITCH, 0),
+    ("ROLL", prop::ROLL, 0),
+    ("LUX", prop::LIGHT, 2),
+    ("mV", prop::BATT_MV, 0),
+    ("mA", prop::BATT_MA, 0),
+    ("TEMP", prop::BATT_TEMP, 1),
+];
+const MORE: [(&str, u8, u32); 2] = [("WORN", prop::WORN, 0), ("TOUCH", prop::TOUCH_GESTURE, 0)];
+
+/// Where the do-nothing program sits: one `END`, then its trigger table.
+const IDLE: u32 = 0x30000;
+
+/// Starts a program at `at` that does nothing: a single `END`, run once. A running program keeps the right arm's
+/// light sensor taking readings (VM.md §6.6) without the firmware's automatic brightness, and this one never runs
+/// anything that could get in the way of the host's drawing. Turns automatic brightness off.
+pub(crate) async fn start_idle_program(arm: &mut crate::v5_link::Arm, at: u32) -> Result<(), Error> {
+    let table_at = at + 16;
+    let mut table = [0u32; 16];
+    table[0] = at;
+    let table: Vec<u8> = table.iter().flat_map(|v| v.to_le_bytes()).collect();
+    arm.run([
+        v5::set(prop::AUTO_BRIGHTNESS, 0),
+        v5::set(prop::PEER_LINK, 0),
+        v5::write(at, &[v5::END]),
+        v5::write(table_at, &table),
+    ])
+    .await?;
+    arm.flush().await?;
+    arm.control(v5::ctrl::VM_START, &table_at.to_le_bytes()).await?;
+    Ok(())
 }
 
-/// The rows of each column: a label, and where its value comes from, with how many decimals the raw value carries.
-fn rows(side: Side) -> Vec<(&'static str, Value)> {
-    vec![
-        (if side == Side::Left { "LEFT" } else { "RIGHT" }, Value::Title),
-        ("ACC X", Value::Prop(prop::ACC_X, 0)),
-        ("ACC Y", Value::Prop(prop::ACC_Y, 0)),
-        ("ACC Z", Value::Prop(prop::ACC_Z, 0)),
-        ("GYR X", Value::Prop(prop::GYR_X, 0)),
-        ("GYR Y", Value::Prop(prop::GYR_Y, 0)),
-        ("GYR Z", Value::Prop(prop::GYR_Z, 0)),
-        ("PITCH", Value::Prop(prop::PITCH, 0)),
-        ("ROLL", Value::Prop(prop::ROLL, 0)),
-        ("LUX", Value::Prop(prop::LIGHT, 2)),
-        ("BAT mV", Value::Prop(prop::BATT_MV, 0)),
-        ("BAT mA", Value::Prop(prop::BATT_MA, 0)),
-        ("TEMP C", Value::Prop(prop::BATT_TEMP, 1)),
-        ("WORN", Value::Prop(prop::WORN, 0)),
-        ("TOUCH", Value::Prop(prop::TOUCH_GESTURE, 0)),
-        ("FRAME", Value::Frames),
-    ]
+/// Even's light-to-brightness table (VM.md §6.7), for `lux_hundredths` of ambient light, plus `boost` levels.
+pub(crate) fn brightness_for(lux_hundredths: u32, boost: u8) -> u32 {
+    let lux = lux_hundredths / 100;
+    let level = match lux {
+        0..50 => lux / 5,
+        50..200 => 10 + (lux - 50) / 10,
+        200..1000 => 25 + (lux - 200) / 50,
+        1000..2000 => 41,
+        _ => 42,
+    };
+    (level + boost as u32).min(42)
 }
 
-/// The program, its constant pool, and the label strings (glyph indices) to put at LABELS.
-fn program(side: Side) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, u32, u32), String> {
-    let mut a = Asm::new(CODE, POOL);
-    let mut labels = Vec::new();
-    let question = LABELS + labels.len() as u32;
-    labels.extend(v5::text_indices("?"));
-    let (frame, stride, font) = (a.k(v5::FRAME), a.k(v5::STRIDE), a.k(v5::FONT));
-    let (zero, one, ten, unknown) = (a.k(0), a.k(1), a.k(10), a.k(v5::UNKNOWN));
-
-    // START: fire the timer at once.
-    a.label("start");
-    let (time, timer) = (a.k(prop::TIME_US as u32), a.k(prop::TIMER as u32));
-    a.op(SYS_READ, &[R11, time]);
-    a.op(SYS_WRITE, &[timer, R11]);
-    a.op(END, &[]);
-
-    // TIMER: the level line, every eighth time the text, then the timer again.
-    a.label("tick");
-    a.op(ADD, &[var(FRAMES), var(FRAMES), one]);
-    let (bx, by, bw, bh) = (a.k(BOX_X), a.k(BOX_Y), a.k(BOX_W), a.k(BOX_H));
-    a.op(FILL, &[frame, stride, bx, by, bw, bh, zero]);
-    // A fixed mark in the middle to read the line against.
-    let (dim, two, twenty) = (a.k(6), a.k(2), a.k(20));
-    for x in [CX - 40, CX + 20] {
-        let x = a.k(x);
-        let y = a.k(CY);
-        a.op(FILL, &[frame, stride, x, y, twenty, two, dim]);
+/// A raw reading as text: signed, with `decimals` moved behind a point, `?` for none.
+fn format(value: u32, decimals: u32) -> String {
+    if value == v5::UNKNOWN {
+        return "?".into();
     }
-    for (reg, p) in [(R0, prop::ACC_X), (R1, prop::ACC_Y), (R2, prop::ACC_Z)] {
-        let p = a.k(p as u32);
-        a.op(SYS_READ, &[reg, p]);
-        a.branch(BEQ, reg, unknown, "no_line");
+    let value = value as i32;
+    if decimals == 0 {
+        return value.to_string();
     }
-    a.op(ADD, &[R0, R0, var(CAL_X)]);
-    a.op(ADD, &[R1, R1, var(CAL_Y)]);
-    a.op(ADD, &[R2, R2, var(CAL_Z)]);
-    // Looking up (acc_z below 0) moves the horizon down: centre y = CY + (−acc_z / 1000) · PITCH_PX.
-    let (pitch_px, thousand, half, cx, cy) = (a.k(PITCH_PX), a.k(1000), a.k(HALF_LINE), a.k(CX), a.k(CY));
-    a.op(MUL, &[R3, R2, pitch_px]);
-    a.op(DIVS, &[R3, R3, thousand]);
-    a.op(SUB, &[R3, cy, R3]);
-    // The horizon runs along (acc_y, acc_x) on the panel, y down: tilting the head right turns it left.
-    a.op(MUL, &[R4, R1, half]);
-    a.op(DIVS, &[R4, R4, thousand]);
-    a.op(MUL, &[R5, R0, half]);
-    a.op(DIVS, &[R5, R5, thousand]);
-    a.op(SUB, &[R6, cx, R4]);
-    a.op(SUB, &[R7, R3, R5]);
-    a.op(ADD, &[R8, cx, R4]);
-    a.op(ADD, &[R9, R3, R5]);
-    let bright = a.k(15);
-    a.op(LINE, &[frame, stride, R6, R7, R8, R9, bright]);
-    a.op(ADD, &[R7, R7, one]);
-    a.op(ADD, &[R9, R9, one]);
-    a.op(LINE, &[frame, stride, R6, R7, R8, R9, bright]);
-    a.label("no_line");
-    a.op(DRAW, &[frame, stride, bx, by, bx, by, bw, bh]);
-
-    let every = a.k(TEXT_EVERY);
-    a.op(MODU, &[R10, var(FRAMES), every]);
-    a.branch(BNE, R10, zero, "rearm");
-    let rows = rows(side);
-    let (text_y, col_w, text_h) = (a.k(TEXT_Y), a.k(COL_W), a.k(ROW * rows.len() as u32));
-    a.op(FILL, &[frame, stride, var(COL_X), text_y, col_w, text_h, zero]);
-    let mask = a.k(MASK);
-    for (i, (label, value)) in rows.iter().enumerate() {
-        let baseline = a.k(TEXT_Y + i as u32 * ROW + ASCENT);
-        let indices = v5::text_indices(label);
-        let (at, n) = (a.k(LABELS + labels.len() as u32), a.k(indices.len() as u32));
-        labels.extend(indices);
-        let level = a.k(if matches!(value, Value::Title) { 15 } else { 8 });
-        a.op(GLYPHS, &[font, frame, stride, var(COL_X), baseline, mask, level, at, n]);
-        let decimals = match value {
-            Value::Title => continue,
-            Value::Prop(p, decimals) => {
-                let p = a.k(*p as u32);
-                a.op(SYS_READ, &[R0, p]);
-                *decimals
-            }
-            Value::Frames => {
-                a.op(MOV, &[R0, var(FRAMES)]);
-                0
-            }
-        };
-        let decimals = a.k(decimals);
-        a.op(MOV, &[R1, var(COL_R)]);
-        a.op(MOV, &[R2, baseline]);
-        a.op(MOV, &[R9, decimals]);
-        a.jump(CALL, "number");
-    }
-    a.op(DRAW, &[frame, stride, var(COL_X), text_y, var(COL_X), text_y, col_w, text_h]);
-
-    a.label("rearm");
-    let period = a.k(PERIOD_US);
-    a.op(SYS_READ, &[R11, time]);
-    a.op(ADD, &[R11, R11, period]);
-    a.op(SYS_WRITE, &[timer, R11]);
-    a.op(END, &[]);
-
-    // number: r0 (signed, with r9 decimals) drawn right-aligned to x r1 on baseline r2, or `?` for UNKNOWN. Digits
-    // go into DIGITS from its end backwards, as in VM.md §4.3.
-    let (digits, end, dot, minus, advance) = (
-        a.k(DIGITS),
-        a.k(16),
-        a.k(v5::text_indices(".")[0] as u32),
-        a.k(v5::text_indices("-")[0] as u32),
-        a.k(ADVANCE),
-    );
-    a.label("number");
-    a.branch(BEQ, R0, unknown, "number_unknown");
-    a.op(MOV, &[R3, zero]);
-    a.branch(BGES, R0, zero, "number_positive");
-    a.op(SUB, &[R0, zero, R0]);
-    a.op(MOV, &[R3, one]);
-    a.label("number_positive");
-    a.op(MOV, &[R4, end]);
-    a.op(MOV, &[R10, zero]);
-    a.label("number_digit");
-    // The decimal point goes in once `decimals` digits are out.
-    a.branch(BEQ, R9, zero, "number_no_dot");
-    a.branch(BNE, R10, R9, "number_no_dot");
-    a.op(SUB, &[R4, R4, one]);
-    a.op(ST8, &[digits, R4, dot]);
-    a.label("number_no_dot");
-    a.op(SUB, &[R4, R4, one]);
-    a.op(MODU, &[R5, R0, ten]);
-    a.op(ST8, &[digits, R4, R5]);
-    a.op(DIVU, &[R0, R0, ten]);
-    a.op(ADD, &[R10, R10, one]);
-    a.branch(BNE, R0, zero, "number_digit");
-    // At least one digit before the point: 5 with one decimal is 0.5.
-    a.branch(BGES, R9, R10, "number_digit");
-    a.branch(BEQ, R3, zero, "number_draw");
-    a.op(SUB, &[R4, R4, one]);
-    a.op(ST8, &[digits, R4, minus]);
-    a.label("number_draw");
-    a.op(ADD, &[R6, R4, digits]);
-    a.op(SUB, &[R7, end, R4]);
-    a.op(MUL, &[R8, R7, advance]);
-    a.op(SUB, &[R8, R1, R8]);
-    a.op(GLYPHS, &[font, frame, stride, R8, R2, mask, bright, R6, R7]);
-    a.op(RET, &[]);
-    a.label("number_unknown");
-    a.op(SUB, &[R8, R1, advance]);
-    let question = a.k(question);
-    a.op(GLYPHS, &[font, frame, stride, R8, R2, mask, bright, question, one]);
-    a.op(RET, &[]);
-
-    let (start, tick) = (a.address("start"), a.address("tick"));
-    let (code, pool) = a.finish()?;
-    assert!(POOL + pool.len() as u32 <= VARS && LABELS + labels.len() as u32 <= DIGITS);
-    Ok((code, pool, labels, start, tick))
+    let scale = 10i64.pow(decimals);
+    let magnitude = (value as i64).abs();
+    let sign = if value < 0 { "-" } else { "" };
+    format!("{sign}{}.{:0width$}", magnitude / scale, magnitude % scale, width = decimals as usize)
 }
 
-/// Mean acceleration over about a second, in mg.
-async fn mean_acceleration(arm: &mut Arm) -> Result<[i32; 3], Error> {
-    let mut sum = [0i64; 3];
-    let mut n = 0;
-    for _ in 0..20 {
-        let p = arm.props(&[prop::ACC_X, prop::ACC_Y, prop::ACC_Z]).await?;
-        if p.iter().all(|&v| v != v5::UNKNOWN) {
-            for (s, v) in sum.iter_mut().zip(p) {
-                *s += v as i32 as i64;
-            }
-            n += 1;
+fn text(code: &mut Vec<Vec<u8>>, x: i32, baseline: i32, level: u8, text: &str) {
+    let indices = v5::text_indices(text);
+    code.push(v5::write(v5::TEXT, &indices));
+    code.push(v5::glyphs(x, baseline, level, indices.len()));
+}
+
+/// The labels of a column, after its title.
+fn labels() -> impl Iterator<Item = &'static str> {
+    READINGS.iter().chain(&MORE).map(|r| r.0).chain(["FPS"])
+}
+
+fn baseline(row: usize) -> i32 {
+    TOP + (row as i32 + 1) * ROW + ASCENT
+}
+
+/// Where the column of the arm on `side` sits, and its title.
+fn column_x(side: Side) -> (i32, &'static str) {
+    match side {
+        Side::Left => (MARGIN, "LEFT ARM"),
+        Side::Right => (v5::WIDTH as i32 - MARGIN - COL_W as i32, "RIGHT ARM"),
+    }
+}
+
+/// Instructions that draw a column's title and labels, which don't change, into the frame.
+fn column_labels(code: &mut Vec<Vec<u8>>, side: Side) {
+    let (x, title) = column_x(side);
+    text(code, x, TOP + ASCENT, 15, title);
+    for (i, label) in labels().enumerate() {
+        text(code, x, baseline(i), 8, label);
+    }
+}
+
+/// Instructions that draw a column's values into the frame, right-aligned, without showing them.
+fn column_values(code: &mut Vec<Vec<u8>>, side: Side, values: &[String]) {
+    let x = column_x(side).0 + VALUE_X;
+    code.push(v5::fill(x, 0, VALUE_W, v5::HEIGHT, 0));
+    // All the values' glyphs in one write, then one GLYPHS each.
+    let mut all = Vec::new();
+    let mut at = Vec::new();
+    for value in values {
+        at.push((v5::TEXT + all.len() as u32, value.chars().count()));
+        all.extend(v5::text_indices(value));
+    }
+    code.push(v5::write(v5::TEXT, &all));
+    for (i, &(text, n)) in at.iter().enumerate() {
+        let right = x + VALUE_W as i32 - ADVANCE * n as i32;
+        code.push(v5::glyphs_k(right, baseline(i), 15, text, n));
+    }
+}
+
+/// The marks in the middle to read the level line against, as lines at `level`.
+fn marks(code: &mut Vec<Vec<u8>>, level: u8) {
+    code.push(v5::line_k(CX - 60, CY, CX - 20, CY, level));
+    code.push(v5::line_k(CX + 20, CY, CX + 60, CY, level));
+}
+
+/// The level line, kept so each frame only erases the last one and draws the next.
+#[derive(Default)]
+struct LevelLine {
+    last: Option<[i32; 4]>,
+}
+
+impl LevelLine {
+    /// Instructions that move the line to where gravity `acc` (mg, head frame) puts it, without showing it. Returns
+    /// the rows that changed, to show.
+    fn draw(&mut self, code: &mut Vec<Vec<u8>>, acc: Option<[f64; 3]>) -> Option<(i32, i32)> {
+        let next = acc.and_then(line_for);
+        if next == self.last {
+            return None;
         }
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        let mut rows: Vec<i32> = Vec::new();
+        if let Some([x0, y0, x1, y1]) = self.last {
+            code.push(v5::line_k(x0, y0, x1, y1, 0));
+            rows.extend([y0, y1]);
+            // The erased line may have crossed the marks.
+            if y0.min(y1) <= CY && y0.max(y1) >= CY {
+                marks(code, 6);
+                rows.push(CY);
+            }
+        }
+        if let Some([x0, y0, x1, y1]) = next {
+            code.push(v5::line_k(x0, y0, x1, y1, 15));
+            rows.extend([y0, y1]);
+        }
+        self.last = next;
+        let top = rows.iter().min()?.clamp(&0, &(v5::HEIGHT as i32 - 1));
+        let bottom = rows.iter().max()?.clamp(&0, &(v5::HEIGHT as i32 - 1));
+        Some((*top, *bottom))
     }
-    if n == 0 {
-        return Err(format!("{} arm's accelerometer gives no readings", side_name(arm.side)).into());
-    }
-    Ok(sum.map(|s| (s / n) as i32))
 }
 
-pub async fn sensors(side: Option<Side>) -> Result<(), Error> {
+/// Where the level line goes for gravity `acc`: across the band's middle when the head is level.
+fn line_for([ax, ay, az]: [f64; 3]) -> Option<[i32; 4]> {
+    let across = ax.hypot(ay);
+    if across < 1.0 {
+        return None;
+    }
+    // Looking up (acc_z below 0) moves the horizon down; tilting the head right turns it the other way, along
+    // (acc_y, acc_x) on the panel, y down.
+    let pitch = (-az).atan2(across);
+    let cy = (CY as f64 + pitch * PITCH_PX).clamp(-2000.0, 2000.0);
+    let (dx, dy) = (ay / across * HALF_LINE, ax / across * HALF_LINE);
+    Some([CX as f64 - dx, cy - dy, CX as f64 + dx, cy + dy].map(|v| v.round() as i32))
+}
+
+/// The readings asked for in turn, one request a frame: the accelerometer is in both, so it's fresh every frame.
+fn groups() -> [Vec<u8>; 2] {
+    let acc = [prop::ACC_X, prop::ACC_Y, prop::ACC_Z];
+    let rest: Vec<u8> = READINGS.iter().chain(&MORE).map(|r| r.1).filter(|p| !acc.contains(p)).collect();
+    let (first, second) = rest.split_at(9);
+    [[&acc[..], first].concat(), [&acc[..], second].concat()]
+}
+
+/// A read in flight on one arm: its tag, what it asked for, and when.
+struct Read {
+    tag: u8,
+    ids: Vec<u8>,
+    sent: std::time::Instant,
+}
+
+/// The index in a column's readings of property `id`.
+fn reading_index(id: u8) -> usize {
+    READINGS.iter().chain(&MORE).position(|r| r.1 == id).unwrap()
+}
+
+/// `boost` adds that many levels to Even's automatic brightness.
+pub async fn sensors(side: Option<Side>, boost: u8) -> Result<(), Error> {
     let mut arms = crate::v0::arms(side).await?;
+    let mut lead = Duration::ZERO;
     for arm in &mut arms {
         arm.control(v5::ctrl::VM_STOP, &[]).await?;
         crate::v0::upload_font(arm, SCALE).await?;
@@ -276,75 +239,192 @@ pub async fn sensors(side: Option<Side>) -> Result<(), Error> {
             v5::set(prop::IMU_RATE, 104),
             v5::set(prop::GYRO_RATE, 104),
             v5::fill(0, 0, v5::WIDTH, v5::HEIGHT, 0),
-            v5::draw(0, 0, v5::WIDTH, v5::HEIGHT),
         ])
         .await?;
-        arm.flush().await?;
-    }
-
-    // Hold still for a second: the arms' accelerometers sit at slightly different angles, and each line gets the
-    // difference to the pair's mean, so the two eyes' lines match.
-    println!("measuring the arms' accelerometers; keep your head still for a second");
-    let mut readings = Vec::new();
-    for arm in &mut arms {
-        readings.push(mean_acceleration(arm).await?);
-    }
-    let mean: Vec<i32> = (0..3).map(|i| readings.iter().map(|r| r[i]).sum::<i32>() / readings.len() as i32).collect();
-
-    for (arm, reading) in arms.iter_mut().zip(&readings) {
-        let (code, pool, labels, start, tick) = program(arm.side)?;
-        let col_x = if arm.side == Side::Left { 4 } else { v5::WIDTH - 4 - COL_W };
-        let vars =
-            [0, mean[0] - reading[0], mean[1] - reading[1], mean[2] - reading[2], col_x as i32, (col_x + COL_W) as i32];
-        let vars: Vec<u8> = vars.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let mut table = [0u32; 16];
-        table[0] = start;
-        table[1] = tick;
-        let table: Vec<u8> = table.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let max = arm.max_code;
-        let mut writes = v5::upload(POOL, &pool, max);
-        writes.extend(v5::upload(VARS, &vars, max));
-        writes.extend(v5::upload(LABELS, &labels, max));
-        writes.extend(v5::upload(CODE, &code, max));
-        writes.extend(v5::upload(TABLE, &table, max));
-        arm.run(writes).await?;
-        arm.flush().await?;
-        arm.control(v5::ctrl::VM_START, &TABLE.to_le_bytes()).await?;
-        println!(
-            "{} arm: {} bytes of program running, correction {:+} {:+} {:+} mg",
-            side_name(arm.side),
-            code.len(),
-            mean[0] - reading[0],
-            mean[1] - reading[1],
-            mean[2] - reading[2]
-        );
-    }
-
-    // Watch for a moment in case a program stops on an error.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    for arm in &mut arms {
-        let status = arm.control(v5::ctrl::VM_STATUS, &[]).await?;
-        let state = ["stopped", "running", "halted"].get(status[0] as usize).copied().unwrap_or("?");
-        let address = u32::from_le_bytes(status[8..12].try_into()?);
-        let halt = status[15];
-        let pauses = u16::from_le_bytes(status[29..31].try_into()?);
-        print!(
-            "{} arm: program {state}, busy {} ms per 100 ms, {pauses} pauses for running too long",
-            side_name(arm.side),
-            status[31]
-        );
-        if status[0] == 2 {
-            print!(", halted at {address:#x}: {}", v5::error_name(halt));
+        let sides: Vec<Side> = crate::v0::SIDES.into_iter().filter(|s| side.is_none_or(|only| only == *s)).collect();
+        let mut code = vec![v5::fixed_args()];
+        marks(&mut code, 6);
+        for &s in &sides {
+            column_labels(&mut code, s);
         }
-        println!();
+        code.push(v5::draw(0, 0, v5::WIDTH, v5::HEIGHT));
+        arm.run(code).await?;
+        arm.flush().await?;
+        for _ in 0..2 {
+            match arm.ask_for_fast_link().await {
+                Ok(interval) if interval <= Duration::from_millis(15) => break,
+                Ok(_) => {}
+                Err(e) => link::trace(format_args!("{e}")),
+            }
+        }
+        let round_trip = arm.sync_clock().await?;
+        lead = lead.max(2 * arm.interval() + round_trip / 2 + Duration::from_millis(15));
+    }
+    // Brightness follows the right arm's light sensor, set from here so it can be boosted and both eyes match. The
+    // sensor only takes readings while something uses it, which a running program does: this one is a single END,
+    // so it never runs anything that could get in the way of the drawing.
+    for arm in &mut arms {
+        start_idle_program(arm, IDLE).await?;
+    }
+    let mut brightness: Option<u32> = None;
+    let max_code = arms.iter().map(|a| a.max_code).min().unwrap_or(64);
+    println!("running; Ctrl-C to stop");
+
+    let mut next_due: Option<u32> = None;
+    let mut level = LevelLine::default();
+    // The columns take turns being redrawn.
+    let sides: Vec<Side> = arms.iter().map(|a| a.side).collect();
+    let mut columns = sides.into_iter().cycle();
+    let mut readings: Vec<Vec<u32>> = vec![vec![v5::UNKNOWN; READINGS.len() + MORE.len()]; arms.len()];
+    let mut reads: Vec<Option<Read>> = arms.iter().map(|_| None).collect();
+    let groups = groups();
+    let mut queued: Vec<std::collections::VecDeque<u16>> = vec![Default::default(); arms.len()];
+    let mut frames = 0u64;
+    let mut recent = std::collections::VecDeque::new();
+    let mut reported = std::time::Instant::now();
+    // Time spent reading, waiting for room and sending, for the progress log.
+    let mut spent = [Duration::ZERO; 3];
+    let stop = tokio::signal::ctrl_c();
+    tokio::pin!(stop);
+    loop {
+        let text_frame = frames.is_multiple_of(TEXT_EVERY);
+        frames += 1;
+        let now = std::time::Instant::now();
+        recent.push_back(now);
+        while recent.len() > 30 {
+            recent.pop_front();
+        }
+        let rate = match (recent.front(), recent.len()) {
+            (Some(first), n) if n > 1 => (n - 1) as f64 / now.duration_since(*first).as_secs_f64(),
+            _ => 0.0,
+        };
+        if reported.elapsed() > Duration::from_secs(5) {
+            println!("frame {frames}, {rate:.1}/s");
+            let total: Duration = spent.iter().sum();
+            link::trace(format_args!("read {:?}, wait {:?}, send {:?} of {total:?}", spent[0], spent[1], spent[2]));
+            spent = [Duration::ZERO; 3];
+            for (arm, values) in arms.iter().zip(&readings) {
+                link::trace(format_args!("{}: {}, light {}", arm.side.letter(), arm.state(), format(values[8], 2)));
+            }
+            reported = now;
+        }
+        let frame = async {
+            // Take in the readings that have arrived, and ask for the next ones. Waiting for them would cost a
+            // round trip behind the frames in flight every frame; instead each frame shows the latest in.
+            let mut phase = std::time::Instant::now();
+            for ((arm, read), have) in arms.iter_mut().zip(&mut reads).zip(&mut readings) {
+                arm.poll().await?;
+                if let Some(r) = read
+                    && let Some(reply) = arm.reply(r.tag)
+                {
+                    for (&id, value) in r.ids.iter().zip(reply?.as_chunks::<4>().0) {
+                        have[reading_index(id)] = u32::from_le_bytes(*value);
+                    }
+                    *read = None;
+                }
+                if read.as_ref().is_none_or(|r| r.sent.elapsed() > Duration::from_millis(500)) {
+                    let ids = groups[(frames % 2) as usize].clone();
+                    let tag = arm.request(v5::ctrl::PROPS, &ids).await?;
+                    *read = Some(Read { tag, ids, sent: std::time::Instant::now() });
+                }
+            }
+            spent[0] += phase.elapsed();
+            phase = std::time::Instant::now();
+
+            let mut code = Vec::new();
+            let column = text_frame.then(|| columns.next()).flatten();
+            if let Some((arm, values)) = column.and_then(|c| arms.iter().zip(&readings).find(|(a, _)| a.side == c)) {
+                let mut shown: Vec<String> =
+                    READINGS.iter().chain(&MORE).zip(values).map(|(r, &v)| format(v, r.2)).collect();
+                shown.push(format!("{rate:.1}"));
+                column_values(&mut code, arm.side, &shown);
+            }
+            // Both arms' accelerometers averaged, so both eyes get the same line.
+            let known: Vec<[f64; 3]> = readings
+                .iter()
+                .filter(|r| r[..3].iter().all(|&v| v != v5::UNKNOWN))
+                .map(|r| [0, 1, 2].map(|i| r[i] as i32 as f64))
+                .collect();
+            let acc = (!known.is_empty())
+                .then(|| [0, 1, 2].map(|i| known.iter().map(|a| a[i]).sum::<f64>() / known.len() as f64));
+            if column.is_some() {
+                let lux = readings.iter().map(|r| r[reading_index(prop::LIGHT)]).find(|&l| l != v5::UNKNOWN);
+                if let Some(lux) = lux {
+                    let want = brightness_for(lux, boost);
+                    if brightness.is_none_or(|b| b.abs_diff(want) >= 2) {
+                        code.push(v5::set(prop::BRIGHTNESS, want));
+                        brightness = Some(want);
+                        link::trace(format_args!("brightness {want} for {} lux", format(lux, 2)));
+                    }
+                }
+            }
+            let changed = level.draw(&mut code, acc);
+            if code.is_empty() {
+                // Nothing moved: wait for the next beat.
+                tokio::time::sleep(PERIOD).await;
+                return Ok::<(), Error>(());
+            }
+
+            let waits = arms.iter_mut().zip(&mut queued).map(|(arm, queued)| async move {
+                while queued.len() >= QUEUE {
+                    arm.wait_for(queued.pop_front().unwrap()).await?;
+                }
+                Ok::<(), Error>(())
+            });
+            futures::future::try_join_all(waits).await?;
+            spent[1] += phase.elapsed();
+            phase = std::time::Instant::now();
+            // Time for this frame's packets too, two per connection event, so both arms have it before it's due.
+            let packets = v5::pack(code.clone(), max_code).len() as u32 + 1;
+            let interval = arms.iter().map(|a| a.interval()).max().unwrap_or_default();
+            let lead = (lead + interval * packets / 2).as_micros() as u32;
+            // On the beat if this frame can make it there in time, else as soon as it can, and the beat moves.
+            let earliest = v5_link::host_us().wrapping_add(lead);
+            let due = match next_due {
+                Some(due) if (due.wrapping_sub(earliest) as i32) > 0 => due,
+                _ => earliest,
+            };
+            let send_at = due.wrapping_sub(lead).wrapping_sub(v5_link::host_us()) as i32;
+            if send_at > 0 {
+                tokio::time::sleep(Duration::from_micros(send_at as u64)).await;
+            }
+            next_due = Some(due.wrapping_add(PERIOD.as_micros() as u32));
+            let sends = arms.iter_mut().zip(&mut queued).map(|(arm, queued)| {
+                let mut code = code.clone();
+                code.push(v5::sleep_until(arm.arm_time(due)));
+                if let Some((top, bottom)) = changed {
+                    code.push(v5::draw(BOX_X, top, BOX_W, (bottom - top + 1) as u32));
+                }
+                if let Some(side) = column {
+                    code.push(v5::draw(column_x(side).0 + VALUE_X, 0, VALUE_W, v5::HEIGHT));
+                }
+                async move {
+                    arm.run(code).await?;
+                    queued.push_back(arm.sent());
+                    Ok::<(), Error>(())
+                }
+            });
+            futures::future::try_join_all(sends).await?;
+            spent[2] += phase.elapsed();
+            Ok::<(), Error>(())
+        };
+        tokio::select! {
+            _ = &mut stop => break,
+            done = frame => done?,
+        }
+    }
+    for arm in &mut arms {
+        arm.control(v5::ctrl::VM_STOP, &[]).await?;
+        arm.run([v5::set(prop::IMU_RATE, 13), v5::set(prop::GYRO_RATE, 0), v5::set(prop::PANEL, 0)]).await?;
+        arm.flush().await?;
     }
     for arm in arms {
         arm.disconnect().await;
     }
-    println!("it keeps running without the Mac; `erisg1 v0 stop` stops it");
     Ok(())
 }
 
+/// Stops a program running on the arms and switches the panel off.
 pub async fn stop(side: Option<Side>) -> Result<(), Error> {
     let mut arms = crate::v0::arms(side).await?;
     for arm in &mut arms {
@@ -363,13 +443,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn assembles() {
-        for side in [Side::Left, Side::Right] {
-            let (code, pool, labels, start, tick) = program(side).unwrap();
-            assert_eq!(start, CODE);
-            assert!(tick > start && (tick as usize) < CODE as usize + code.len());
-            assert!(CODE + code.len() as u32 <= v5::ARENA);
-            assert!(!pool.is_empty() && !labels.is_empty());
-        }
+    fn follows_evens_brightness_table() {
+        assert_eq!(brightness_for(0, 0), 0);
+        assert_eq!(brightness_for(0, 5), 5);
+        assert_eq!(brightness_for(100 * 100, 0), 15);
+        assert_eq!(brightness_for(5000 * 100, 5), 42);
+    }
+
+    #[test]
+    fn formats_readings() {
+        assert_eq!(format(339, 1), "33.9");
+        assert_eq!(format(5, 1), "0.5");
+        assert_eq!(format((-1234i32) as u32, 2), "-12.34");
+        assert_eq!(format((-7i32) as u32, 0), "-7");
+        assert_eq!(format(v5::UNKNOWN, 1), "?");
+    }
+
+    #[test]
+    fn level_line_tilts_with_the_head() {
+        // Head upright: level, through the middle.
+        assert_eq!(line_for([0.0, 1000.0, 0.0]), Some([CX - 100, CY, CX + 100, CY]));
+        // Head tilted right (acc_x below 0): the right end goes up.
+        let [_, y0, _, y1] = line_for([-500.0, 866.0, 0.0]).unwrap();
+        assert!(y1 < y0);
+        // Looking up (acc_z below 0): the line goes down.
+        assert!(line_for([0.0, 900.0, -400.0]).unwrap()[1] > CY);
+    }
+
+    #[test]
+    fn level_line_redraws_only_what_moved() {
+        let mut level = LevelLine::default();
+        let mut code = Vec::new();
+        assert_eq!(level.draw(&mut code, Some([0.0, 1000.0, 0.0])), Some((CY, CY)));
+        assert_eq!(code.len(), 1);
+        // The same reading again changes nothing.
+        let mut code = Vec::new();
+        assert_eq!(level.draw(&mut code, Some([0.0, 1000.0, 0.0])), None);
+        assert!(code.is_empty());
+        // Moving off the marks erases the old line and puts the marks back.
+        let mut code = Vec::new();
+        let (top, bottom) = level.draw(&mut code, Some([0.0, 900.0, -400.0])).unwrap();
+        assert_eq!(code.len(), 4);
+        assert!(top == CY && bottom > CY);
     }
 }

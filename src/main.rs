@@ -12,6 +12,7 @@ mod mcuboot;
 mod proto;
 mod smp;
 mod v0;
+mod v0_flight;
 mod v0_sensors;
 mod v5;
 mod v5_asm;
@@ -223,14 +224,25 @@ enum V0Command {
         #[arg(long, value_parser = ["left", "right"])]
         arm: Option<String>,
     },
-    /// A sensor HUD that runs on the arms themselves, with no Mac needed once it's loaded: a level line from the
-    /// accelerometer, and each arm's raw accelerometer, gyroscope, light, battery, wear and touch readings on its own
-    /// side.
+    /// Every sensor reading of both arms, the left arm's in a column on the left and the right's on the right, and a
+    /// level line from the accelerometers between them, the same in both eyes, until Ctrl-C.
     Sensors {
+        /// Levels (of 42) added to the brightness Even's light table gives.
+        #[arg(long, default_value_t = 0)]
+        boost: u8,
         #[arg(long, value_parser = ["left", "right"])]
         arm: Option<String>,
     },
-    /// Stop a program running on the arms (such as `sensors`) and switch the panel off.
+    /// A mock flight HUD with your head as the controls: tilt it up to climb, bank it to turn. A pitch ladder,
+    /// heading tape, speed, altitude and G, drawn by the arms themselves from about 110 bytes a frame.
+    Flight {
+        /// Levels (of 42) added to the brightness Even's light table gives.
+        #[arg(long, default_value_t = 5)]
+        boost: u8,
+        #[arg(long, value_parser = ["left", "right"])]
+        arm: Option<String>,
+    },
+    /// Stop any program running on the arms and switch the panel off.
     Stop {
         #[arg(long, value_parser = ["left", "right"])]
         arm: Option<String>,
@@ -343,7 +355,8 @@ async fn v0_command(command: V0Command) -> Result<(), Error> {
         V0Command::Test { arm } => v0::test(pick(arm)).await,
         V0Command::Text { text, scale, x, y, arm } => v0::text(pick(arm), &text, scale, x, y).await,
         V0Command::Hud { scale, arm } => v0::hud(pick(arm), scale).await,
-        V0Command::Sensors { arm } => v0_sensors::sensors(pick(arm)).await,
+        V0Command::Sensors { boost, arm } => v0_sensors::sensors(pick(arm), boost).await,
+        V0Command::Flight { boost, arm } => v0_flight::flight(pick(arm), boost).await,
         V0Command::Stop { arm } => v0_sensors::stop(pick(arm)).await,
         V0Command::Imu { hz, gyro, arm } => v0::imu(pick(arm), hz, gyro).await,
         V0Command::Events { arm } => v0::events(pick(arm)).await,

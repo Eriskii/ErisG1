@@ -81,6 +81,9 @@ redrawn a region at a time, plus the accelerometer, gyroscope, TouchBar and ligh
 | `v0 hud [--scale N]` | Clock, both batteries, head pitch and roll and a frame counter, the same in both eyes. Each frame reaches both arms ahead of time with a moment to show it in each arm's own clock, so the eyes change together; about 20 frames a second on the 15 ms link it asks the Mac for |
 | `v0 imu [--hz N] [--gyro]` | Head pitch and roll, the accelerometer and the gyroscope |
 | `v0 events` | TouchBar gestures, wear, the case and the battery as they happen |
+| `v0 sensors [--boost N]` | Every sensor reading of both arms, the left arm's in a column on the left and the right's on the right, and a level line, the same in both eyes. Brightness follows the right arm's light sensor, N levels up |
+| `v0 flight [--boost N]` | A mock flight HUD with your head as the controls: tilt up to climb, bank or turn to turn. The arms draw it themselves with a routine built by `src/v5_asm.rs`, from about 110 bytes of state a frame; about 14 frames a second |
+| `v0 stop` | Stop any program running on the arms and switch the panel off |
 | `v0 panel off\|on\|standby`, `v0 brightness [0-42] [--auto]`, `v0 reboot [--clear]` | |
 
 `--arm left|right` picks one arm; without it, every g1v0 arm in range.

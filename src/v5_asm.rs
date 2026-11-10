@@ -1,6 +1,6 @@
-//! An assembler for programs that run on a g1v0 arm by themselves (VM.md §2, §5). Operands are arena words: r0–r14
-//! are words 0–14, and every constant lives in a pool the assembler fills as it goes, since the instructions take no
-//! immediate values.
+//! A builder for code that runs on a g1v0 arm (VM.md §2, §5): Rust calls, one per instruction, that come out as the
+//! arm's bytecode. Operands are arena words: r0–r14 are words 0–14, and every constant lives in a pool the builder
+//! fills as it goes, since the instructions take no immediate values.
 
 use std::collections::HashMap;
 
@@ -13,18 +13,19 @@ pub const MUL: u8 = 0x13;
 pub const DIVU: u8 = 0x14;
 pub const MODU: u8 = 0x15;
 pub const DIVS: u8 = 0x16;
+pub const LD16: u8 = 0x21;
 pub const ST8: u8 = 0x26;
 pub const CALL: u8 = 0x31;
 pub const RET: u8 = 0x32;
-pub const END: u8 = 0x33;
 pub const BEQ: u8 = 0x35;
 pub const BNE: u8 = 0x36;
-pub const BGES: u8 = 0x3A;
+pub const JMP: u8 = 0x30;
+pub const BLTS: u8 = 0x39;
+pub const NOTIFY: u8 = 0x43;
 pub const SYS_READ: u8 = 0x44;
-pub const SYS_WRITE: u8 = 0x45;
 pub const FILL: u8 = 0x50;
-pub const GLYPHS: u8 = 0x52;
 pub const DRAW: u8 = 0x53;
+pub const GLYPHS: u8 = 0x52;
 pub const LINE: u8 = 0x54;
 
 pub struct Asm {
@@ -67,7 +68,7 @@ impl Asm {
         assert!(self.labels.insert(name, at).is_none(), "label {name} twice");
     }
 
-    /// `CALL` (or `JMP`, 0x30) to a label.
+    /// `JMP` or `CALL` to a label.
     pub fn jump(&mut self, op: u8, target: &'static str) {
         self.code.push(op);
         self.fixups.push((self.code.len(), target));
@@ -109,7 +110,7 @@ mod tests {
         a.branch(BNE, 0, one, "top");
         a.jump(CALL, "end");
         a.label("end");
-        a.op(END, &[]);
+        a.op(RET, &[]);
         let (code, pool) = a.finish().unwrap();
         // ADD r0, r0, [0x200]: 11 00 f0 00 02
         assert_eq!(&code[..5], &[0x11, 0x00, 0xf0, 0x00, 0x02]);
@@ -117,7 +118,7 @@ mod tests {
         assert_eq!(&code[5..12], &[0x36, 0x0f, 0x00, 0x10, 0x00, 0x00, 0x02]);
         // CALL 0x1010
         assert_eq!(&code[12..16], &[0x31, 0x10, 0x10, 0x00]);
-        assert_eq!(code[16], END);
+        assert_eq!(code[16], RET);
         assert_eq!(pool, 1u32.to_le_bytes());
     }
 

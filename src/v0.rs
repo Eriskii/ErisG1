@@ -8,6 +8,8 @@ use crate::proto::Side;
 use crate::v5::{self, prop, trigger};
 use crate::v5_link::{self, Arm, side_name};
 
+pub(crate) const SIDES: [Side; 2] = [Side::Left, Side::Right];
+
 /// Connects to the arm on `side`, or to every g1v0 arm in range.
 pub(crate) async fn arms(side: Option<Side>) -> Result<Vec<Arm>, Error> {
     let adapter = link::adapter().await?;
@@ -15,12 +17,19 @@ pub(crate) async fn arms(side: Option<Side>) -> Result<Vec<Arm>, Error> {
         Some(side) => vec![side],
         None => vec![Side::Left, Side::Right],
     };
-    let mut found = v5_link::scan(&adapter, Duration::from_secs(10), &wanted).await?;
+    // An arm another run has only just let go of takes a few seconds to advertise again.
+    let mut found = v5_link::scan(&adapter, Duration::from_secs(20), &wanted).await?;
     found.retain(|f| wanted.contains(&f.side));
     if found.is_empty() {
         return Err("no arm running g1v0 in range. Out of the charging case an arm only talks to a computer it has \
                     paired with"
             .into());
+    }
+    for &missing in wanted.iter().filter(|s| !found.iter().any(|f| f.side == **s)) {
+        eprintln!(
+            "the {} arm isn't in range or is busy with another connection; going on without it",
+            side_name(missing)
+        );
     }
     let mut arms = Vec::new();
     for f in found {

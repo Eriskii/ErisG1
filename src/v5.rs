@@ -46,11 +46,14 @@ pub fn parse_name(name: &str) -> Option<(Side, bool)> {
 // arguments into r0, r1, … first and pass those.
 
 const WRITE: u8 = 0x01;
+/// `END`: ends a program's task, or a packet.
+pub const END: u8 = 0x33;
 const SLEEP_UNTIL: u8 = 0x40;
 const SYS_WRITE: u8 = 0x45;
 const FILL: u8 = 0x50;
 const GLYPHS: u8 = 0x52;
 const DRAW: u8 = 0x53;
+const LINE: u8 = 0x54;
 
 /// `WRITE`: `data`, at most 255 bytes, to `addr`.
 pub fn write(addr: u32, data: &[u8]) -> Vec<u8> {
@@ -104,6 +107,38 @@ pub fn draw(x: i32, y: i32, w: u32, h: u32) -> Vec<u8> {
     with_registers(DRAW, &[FRAME, STRIDE, x as u32, y as u32, x as u32, y as u32, w, h])
 }
 
+// Arguments that never change, kept in words 16–19 by `fixed_args`, so `line_k` and `glyphs_k` send only the ones
+// that do: about a quarter less per instruction.
+const W_FRAME: u16 = 16;
+const W_STRIDE: u16 = 17;
+const W_FONT: u16 = 18;
+const W_MASK: u16 = 19;
+
+/// Puts the arguments `line_k` and `glyphs_k` take from the arena there. Send once per session.
+pub fn fixed_args() -> Vec<u8> {
+    let words: Vec<u8> = [FRAME, STRIDE, FONT, 2].iter().flat_map(|v| v.to_le_bytes()).collect();
+    write(W_FRAME as u32 * 4, &words)
+}
+
+/// `LINE`: the frame's pixels from `x0`, `y0` to `x1`, `y1`, both ends included, to `level` (§3.6), with the frame
+/// from `fixed_args`.
+pub fn line_k(x0: i32, y0: i32, x1: i32, y1: i32, level: u8) -> Vec<u8> {
+    let values: Vec<u8> =
+        [x0 as u32, y0 as u32, x1 as u32, y1 as u32, level as u32].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let mut code = write(0, &values);
+    code.extend(instruction(LINE, &[W_FRAME, W_STRIDE, 0, 1, 2, 3, 4]));
+    code
+}
+
+/// `GLYPHS` of the `n` glyph indices at `text`, with the font, frame and text mode from `fixed_args`.
+pub fn glyphs_k(x: i32, y: i32, level: u8, text: u32, n: usize) -> Vec<u8> {
+    let values: Vec<u8> =
+        [x as u32, y as u32, level as u32, text, n as u32].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let mut code = write(0, &values);
+    code.extend(instruction(GLYPHS, &[W_FONT, W_FRAME, W_STRIDE, 0, 1, W_MASK, 2, 3, 4]));
+    code
+}
+
 /// `SLEEP_UNTIL`: the rest of the packet, and every packet after it, waits until the arm's clock reads `t_us`, at most
 /// 2 s ahead (§2.6).
 pub fn sleep_until(t_us: u32) -> Vec<u8> {
@@ -113,6 +148,11 @@ pub fn sleep_until(t_us: u32) -> Vec<u8> {
 /// `SYS_WRITE`: property `prop` to `value` (§2.5).
 pub fn set(prop: u8, value: u32) -> Vec<u8> {
     with_registers(SYS_WRITE, &[prop as u32, value])
+}
+
+/// `CALL`: runs the code stored at `addr` as part of the packet, until its `RET` (§6.2).
+pub fn call(addr: u32) -> Vec<u8> {
+    vec![0x31, addr as u8, (addr >> 8) as u8, (addr >> 16) as u8]
 }
 
 /// Uploads `data` to `addr` as `WRITE`s that each fit in a packet of `max_code` bytes of instructions.
@@ -151,7 +191,6 @@ pub mod ctrl {
     pub const PANEL_READ: u8 = 0x0B;
     pub const VM_START: u8 = 0x10;
     pub const VM_STOP: u8 = 0x11;
-    pub const VM_STATUS: u8 = 0x12;
     pub const EVENTS: u8 = 0x14;
 }
 
@@ -164,7 +203,6 @@ pub fn control(op: u8, tag: u8, body: &[u8]) -> Vec<u8> {
 
 /// Properties (§2.5).
 pub mod prop {
-    pub const TIME_US: u8 = 0x00;
     pub const LINK_INTERVAL: u8 = 0x05;
     pub const BATT_MV: u8 = 0x10;
     pub const BATT_PCT: u8 = 0x11;
@@ -180,7 +218,6 @@ pub mod prop {
     pub const ROLL: u8 = 0x1D;
     pub const BRIGHTNESS: u8 = 0x20;
     pub const PANEL: u8 = 0x21;
-    pub const TIMER: u8 = 0x22;
     pub const IMU_RATE: u8 = 0x28;
     pub const BRIGHTNESS_CAP: u8 = 0x2A;
     pub const GYR_X: u8 = 0x30;
@@ -189,6 +226,7 @@ pub mod prop {
     pub const GYRO_RATE: u8 = 0x33;
     pub const TOUCH_GESTURE: u8 = 0x34;
     pub const AUTO_BRIGHTNESS: u8 = 0x38;
+    pub const PEER_LINK: u8 = 0x39;
 }
 
 /// What a property reads when the arm has no value for it.

@@ -18,6 +18,8 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
 const CONTROL_TRIES: u32 = 3;
 /// How long `flush` waits for the arm to run everything sent.
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long `send` waits for room in the arm's window before giving up.
+const STALL: Duration = Duration::from_secs(5);
 const RTO_MIN: Duration = Duration::from_millis(100);
 const RTO_FIRST: Duration = Duration::from_secs(1);
 
@@ -180,6 +182,32 @@ impl Arm {
         Ok(hello)
     }
 
+    /// Sends a control request without waiting for its reply, which `reply` gives once it's in. Returns its tag.
+    pub async fn request(&mut self, op: u8, body: &[u8]) -> Result<u8, Error> {
+        self.tag = self.tag.wrapping_add(1);
+        self.replies.remove(&self.tag);
+        self.peripheral.write(&self.ctrl, &v5::control(op, self.tag, body), WriteType::WithoutResponse).await?;
+        Ok(self.tag)
+    }
+
+    /// The reply to the request with `tag`, if it has come in: its body, or an error for a refusal.
+    pub fn reply(&mut self, tag: u8) -> Option<Result<Vec<u8>, Error>> {
+        let (status, body) = self.replies.remove(&tag)?;
+        Some(if status == 0 { Ok(body) } else { Err(v5::error_name(status).into()) })
+    }
+
+    /// Takes in whatever the arm has sent, without waiting.
+    pub async fn poll(&mut self) -> Result<(), Error> {
+        while let Ok(data) = self.incoming.try_recv() {
+            if let Some(event) = v5::event(&data)
+                && self.handle(event)?
+            {
+                self.resend(0).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Sends a control request and returns its reply's body, or an error for a refusal.
     pub async fn control(&mut self, op: u8, body: &[u8]) -> Result<Vec<u8>, Error> {
         for _ in 0..CONTROL_TRIES {
@@ -220,7 +248,11 @@ impl Arm {
     }
 
     async fn send(&mut self, code: Vec<u8>) -> Result<(), Error> {
+        let started = Instant::now();
         while self.next_seq.wrapping_sub(self.exec_next) >= v5::WINDOW {
+            if started.elapsed() > STALL {
+                return Err(format!("{} arm stopped taking packets ({})", side_name(self.side), self.state()).into());
+            }
             self.pump(Instant::now() + self.rto.get(self.interval)).await?;
         }
         let seq = self.next_seq;
@@ -245,12 +277,23 @@ impl Arm {
         self.next_seq
     }
 
+    /// Where the packets stand, for errors and tracing.
+    pub fn state(&self) -> String {
+        format!(
+            "sent up to {}, received up to {}, run up to {}, {} unacknowledged",
+            self.next_seq.wrapping_sub(1),
+            self.rx_next.wrapping_sub(1),
+            self.exec_next.wrapping_sub(1),
+            self.unacked.len()
+        )
+    }
+
     /// Waits until the arm has run every packet before `seq`, and reports the first error any of it hit.
     pub async fn wait_for(&mut self, seq: u16) -> Result<(), Error> {
         let deadline = Instant::now() + FLUSH_TIMEOUT;
         while v5::before(self.exec_next, seq) {
             if Instant::now() > deadline {
-                return Err(format!("{} arm stopped running packets", side_name(self.side)).into());
+                return Err(format!("{} arm stopped running packets ({})", side_name(self.side), self.state()).into());
             }
             self.pump(deadline).await?;
         }
