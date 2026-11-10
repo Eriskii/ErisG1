@@ -10,11 +10,14 @@ publish = false
 [dependencies]
 btleplug = "0.13.5"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+ciborium = "0.2"
 clap = { version = "4", features = ["derive"] }
 font8x8 = "0.3"
 futures = "0.3"
+sha2 = "0.11"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 uuid = "1"
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [profile.release]
 lto = true

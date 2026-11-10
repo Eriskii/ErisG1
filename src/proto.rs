@@ -271,6 +271,13 @@ pub fn bitmap_crc(bmp: &[u8]) -> Vec<u8> {
 }
 
 /// CRC-32 as zlib computes it, which crclib (used by Even's demo) calls CRC-32/XZ.
+/// zlib's CRC-32 of `data`.
+pub fn crc32(data: &[u8]) -> u32 {
+    let mut crc = Crc32::default();
+    crc.update(data);
+    crc.finish()
+}
+
 struct Crc32(u32);
 
 impl Default for Crc32 {

@@ -6,8 +6,14 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 
 mod canvas;
+mod dfu;
 mod link;
+mod mcuboot;
 mod proto;
+mod smp;
+mod v0;
+mod v5;
+mod v5_link;
 
 use canvas::Canvas;
 use link::{Error, Glasses};
@@ -133,6 +139,33 @@ enum Command {
         #[arg(long)]
         channel: Option<u32>,
     },
+    /// Commands for arms running the g1v0 firmware (scouter_kit).
+    V0 {
+        #[command(subcommand)]
+        command: V0Command,
+    },
+    /// Show what's in a firmware update (an update .zip or an image .bin) and whether the glasses would take it.
+    Inspect { file: std::path::PathBuf },
+    /// Show which firmware each arm has installed, and what's waiting in its spare slot. Changes nothing.
+    Images {
+        /// Only this arm.
+        #[arg(long, value_parser = ["left", "right"])]
+        arm: Option<String>,
+        #[arg(long)]
+        channel: Option<u32>,
+    },
+    /// Upload the app core image of a firmware update (an update .zip or an app core .bin) to one arm's spare slot and
+    /// check it, leaving the arm running what it did. With --install, then install it, which can't be undone.
+    Flash {
+        file: std::path::PathBuf,
+        #[arg(long, value_parser = ["left", "right"])]
+        arm: String,
+        /// Install the uploaded image and restart into it. The old firmware is gone after this.
+        #[arg(long)]
+        install: bool,
+        #[arg(long)]
+        channel: Option<u32>,
+    },
     /// Connect, show some text, and print what the glasses report until Ctrl-C.
     Connect {
         /// What to show: text (use \n for new lines; the glasses don't wrap), a 576×136 1-bit .bmp file, or
@@ -151,6 +184,81 @@ enum Command {
         /// Also print every notification as hex.
         #[arg(long)]
         raw: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum V0Command {
+    /// List the arms running g1v0 in range.
+    Scan,
+    /// Show each arm's firmware, state, battery and sensors.
+    Hello {
+        #[arg(long, value_parser = ["left", "right"])]
+        arm: Option<String>,
+    },
+    /// Draw a test pattern and read the panel back to check every pixel arrived.
+    Test {
+        #[arg(long, value_parser = ["left", "right"])]
+        arm: Option<String>,
+    },
+    /// Show text (use \n for new lines).
+    Text {
+        text: String,
+        /// How big: the 8×8 font drawn this many times over.
+        #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=10))]
+        scale: u8,
+        #[arg(long, default_value_t = 40)]
+        x: i32,
+        #[arg(long, default_value_t = 40)]
+        y: i32,
+        #[arg(long, value_parser = ["left", "right"])]
+        arm: Option<String>,
+    },
+    /// A clock, the battery, head pitch and roll and a frame counter, redrawn in place as fast as the arms take it.
+    Hud {
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(1..=10))]
+        scale: u8,
+        #[arg(long, value_parser = ["left", "right"])]
+        arm: Option<String>,
+    },
+    /// Print head pitch and roll and the accelerometer, and with --gyro the gyroscope.
+    Imu {
+        #[arg(long, default_value_t = 10)]
+        hz: u32,
+        #[arg(long)]
+        gyro: bool,
+        #[arg(long, value_parser = ["left", "right"])]
+        arm: Option<String>,
+    },
+    /// Print TouchBar, wear, case and battery events.
+    Events {
+        #[arg(long, value_parser = ["left", "right"])]
+        arm: Option<String>,
+    },
+    /// Switch the panel off, on, or to standby (wakes in 4 ms instead of 71).
+    Panel {
+        #[arg(value_parser = ["off", "on", "standby"])]
+        state: String,
+        #[arg(long, value_parser = ["left", "right"])]
+        arm: Option<String>,
+    },
+    /// Restart the arms.
+    Reboot {
+        /// Also clear the count of bad boots, which takes an arm out of safe mode (named G1v0S_L or G1v0S_R).
+        #[arg(long)]
+        clear: bool,
+        #[arg(long, value_parser = ["left", "right"])]
+        arm: Option<String>,
+    },
+    /// Show the brightness, or set it.
+    Brightness {
+        /// 0 to 42.
+        level: Option<u8>,
+        /// Follow the light sensor (on the right arm; the left follows the right).
+        #[arg(long)]
+        auto: bool,
+        #[arg(long, value_parser = ["left", "right"])]
+        arm: Option<String>,
     },
 }
 
@@ -184,6 +292,16 @@ async fn main() -> ExitCode {
         Command::FirmwareLog { state } => firmware_log(state == "on").await,
         Command::Debug { command } => debug(&command).await,
         Command::Probe { listen, channel } => probe(Duration::from_secs(listen), channel).await,
+        Command::V0 { command } => v0_command(command).await,
+        Command::Inspect { file } => dfu::inspect(&file),
+        Command::Images { arm, channel } => {
+            let sides = match arm.as_deref() {
+                Some(arm) => vec![side(arm)],
+                None => vec![Side::Left, Side::Right],
+            };
+            dfu::images(&sides, channel).await
+        }
+        Command::Flash { file, arm, install, channel } => dfu::flash(&file, side(&arm), channel, install).await,
         Command::Connect { show, down, only_up, channel, raw } => {
             let up = Show::parse(&show);
             let down = match (down, only_up) {
@@ -201,6 +319,26 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+async fn v0_command(command: V0Command) -> Result<(), Error> {
+    let pick = |arm: Option<String>| arm.as_deref().map(side);
+    match command {
+        V0Command::Scan => v0::scan().await,
+        V0Command::Hello { arm } => v0::hello(pick(arm)).await,
+        V0Command::Test { arm } => v0::test(pick(arm)).await,
+        V0Command::Text { text, scale, x, y, arm } => v0::text(pick(arm), &text, scale, x, y).await,
+        V0Command::Hud { scale, arm } => v0::hud(pick(arm), scale).await,
+        V0Command::Imu { hz, gyro, arm } => v0::imu(pick(arm), hz, gyro).await,
+        V0Command::Events { arm } => v0::events(pick(arm)).await,
+        V0Command::Panel { state, arm } => v0::panel(pick(arm), &state).await,
+        V0Command::Reboot { clear, arm } => v0::reboot(pick(arm), clear).await,
+        V0Command::Brightness { level, auto, arm } => v0::brightness(pick(arm), level, auto).await,
+    }
+}
+
+fn side(arm: &str) -> Side {
+    if arm == "left" { Side::Left } else { Side::Right }
 }
 
 async fn scan(wait: Duration) -> Result<(), Error> {

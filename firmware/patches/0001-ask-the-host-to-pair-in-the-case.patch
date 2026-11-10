@@ -1,0 +1,26 @@
+diff --git a/g1_firmware/firmware/src/proto.c b/g1_firmware/firmware/src/proto.c
+index f8e9edc..97edfd1 100644
+--- a/g1_firmware/firmware/src/proto.c
++++ b/g1_firmware/firmware/src/proto.c
+@@ -102,13 +102,17 @@ static void sec_timeout(struct k_work *w)
+ 	}
+ }
+ 
+-/* Out of the case: ask the peer to encrypt; a bonded peer does at once, any other is dropped
+- * (security_changed) or, if it does not answer, after the deadline (sec_work). */
++/* Ask the peer to encrypt; a bonded peer does at once. Out of the case any other is dropped
++ * (security_changed) or, if it does not answer, after the deadline (sec_work). In the case, where the arm
++ * is bondable, the request is how a host that cannot start pairing itself (macOS) bonds; a host that does
++ * not pair is still obeyed there. */
+ static void require_encryption(struct bt_conn *c)
+ {
+-	if (IS_ENABLED(CONFIG_G1_REQUIRE_SECURITY) && !g1_in_case() && !conn_encrypted) {
++	if (IS_ENABLED(CONFIG_G1_REQUIRE_SECURITY) && !conn_encrypted) {
+ 		bt_conn_set_security(c, BT_SECURITY_L2);
+-		k_work_schedule(&sec_work, K_SECONDS(10));
++		if (!g1_in_case()) {
++			k_work_schedule(&sec_work, K_SECONDS(10));
++		}
+ 	}
+ }
+ 

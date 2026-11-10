@@ -32,7 +32,7 @@ pub struct Found {
     pub side: Side,
     pub name: String,
     pub rssi: Option<i16>,
-    peripheral: Peripheral,
+    pub(crate) peripheral: Peripheral,
 }
 
 pub async fn adapter() -> Result<Adapter, Error> {

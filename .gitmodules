@@ -1,0 +1,3 @@
+[submodule "firmware/scouter_kit"]
+	path = firmware/scouter_kit
+	url = https://github.com/mafik/scouter_kit.git
