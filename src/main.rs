@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
+mod apps;
 mod canvas;
 mod dfu;
 mod link;
@@ -285,6 +286,27 @@ enum V0Command {
         #[arg(long, value_parser = ["left", "right"])]
         arm: Option<String>,
     },
+    /// List the apps.
+    Apps,
+    /// Run an app on the glasses (`erisg1 v0 apps` lists them), with its arguments after its name.
+    App {
+        #[arg(long, value_parser = ["left", "right"])]
+        arm: Option<String>,
+        name: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run an app (or "all") on two simulated arms and save what each eye shows as an animated PNG.
+    Preview {
+        name: String,
+        #[arg(long, default_value = "previews")]
+        out: std::path::PathBuf,
+    },
+    /// Show a notification through a running `erisg1 v0 app notify`: "TITLE: text", or just text.
+    Say {
+        #[arg(required = true)]
+        text: Vec<String>,
+    },
     /// A frame around the whole 640 × 480 panel with ticks every 16 pixels, the coordinates every 64 and a cross in
     /// the middle, to see how much of it is visible. Stays until `v0 stop`.
     Extents {
@@ -416,6 +438,10 @@ async fn v0_command(command: V0Command) -> Result<(), Error> {
         V0Command::Cube { boost, from_mac: false, arm } => v0_cube_glasses::cube_on_glasses(pick(arm), boost).await,
         V0Command::Pinned { boost, rotation_only, arm } => v0_pinned::pinned(pick(arm), boost, !rotation_only).await,
         V0Command::Follow { boost, lag, radius, arm } => v0_follow::follow_hud(pick(arm), boost, lag, radius).await,
+        V0Command::Apps => apps::list().await,
+        V0Command::App { arm, name, args } => apps::run(&name, pick(arm), &args).await,
+        V0Command::Preview { name, out } => apps::preview(&name, &out).await,
+        V0Command::Say { text } => apps::say(&text.join(" ")).await,
         V0Command::Extents { arm } => v0::extents(pick(arm)).await,
         V0Command::Depth { arm } => v0::depth(pick(arm)).await,
         V0Command::Stop { arm } => v0_sensors::stop(pick(arm)).await,

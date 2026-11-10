@@ -253,6 +253,7 @@ pub mod trigger {
     pub const WEAR: u8 = 7;
     pub const TOUCH: u8 = 8;
     pub const PEER: u8 = 9;
+    pub const USER0: u8 = 12;
 
     pub fn name(id: u8) -> &'static str {
         match id {

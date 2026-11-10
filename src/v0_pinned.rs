@@ -402,10 +402,10 @@ impl Head {
     }
 
     /// Takes in the readings that arrived, moves the tracker on, and asks for the next (the right arm's light now
-    /// and then too). Returns whether a TouchBar was tapped.
-    pub(crate) async fn poll(&mut self, arms: &mut [Arm]) -> Result<bool, Error> {
+    /// and then too). Returns the TouchBar gestures since the last call: the arm and the gesture (VM.md §6.7).
+    pub(crate) async fn poll(&mut self, arms: &mut [Arm]) -> Result<Vec<(Side, u32)>, Error> {
         self.asked += 1;
-        let (mut fresh, mut tapped): (Vec<(V, V)>, bool) = (Vec::new(), false);
+        let (mut fresh, mut gestures): (Vec<(V, V)>, Vec<(Side, u32)>) = (Vec::new(), Vec::new());
         for (i, (arm, read)) in arms.iter_mut().zip(&mut self.reads).enumerate() {
             arm.poll().await?;
             if let Some((tag, ids, _)) = read
@@ -421,7 +421,9 @@ impl Head {
                 *read = None;
             }
             while let Some(event) = arm.events.pop_front() {
-                tapped |= matches!(event.kind, v5::EventKind::Input { trigger: trigger::TOUCH, value: 1 });
+                if let v5::EventKind::Input { trigger: trigger::TOUCH, value } = event.kind {
+                    gestures.push((arm.side, value));
+                }
             }
             if read.as_ref().is_none_or(|r| r.2.elapsed() > Duration::from_millis(300)) {
                 let mut ids = READINGS.to_vec();
@@ -442,7 +444,7 @@ impl Head {
             self.tracker.update(rate, acc, dt);
             self.readings += 1;
         }
-        Ok(tapped)
+        Ok(gestures)
     }
 
     /// The head's turn and position when a frame due at `due` (the Mac's clock) appears, as the latest readings
@@ -475,6 +477,11 @@ impl Beat {
     /// Waits until the arms have room and it's time to send the next frame. Returns the moment it's to appear, in
     /// the Mac's clock.
     pub(crate) async fn next(&mut self, arms: &mut [Arm]) -> Result<u32, Error> {
+        self.next_with(arms, Duration::ZERO).await
+    }
+
+    /// As `next`, for a frame that takes `extra` longer to reach the arms (several packets).
+    pub(crate) async fn next_with(&mut self, arms: &mut [Arm], extra: Duration) -> Result<u32, Error> {
         let waits = arms.iter_mut().zip(&mut self.queued).map(|(arm, queued)| async move {
             while queued.len() >= QUEUE {
                 arm.wait_for(queued.pop_front().unwrap()).await?;
@@ -483,7 +490,7 @@ impl Beat {
         });
         futures::future::try_join_all(waits).await?;
         let interval = arms.iter().map(|a| a.interval()).max().unwrap_or_default();
-        let lead = (self.lead + interval).as_micros() as u32;
+        let lead = (self.lead + interval + extra).as_micros() as u32;
         let earliest = v5_link::host_us().wrapping_add(lead);
         let due = match self.next_due {
             Some(due) if (due.wrapping_sub(earliest) as i32) > 0 => due,
@@ -555,7 +562,7 @@ pub async fn pinned(side: Option<Side>, boost: u8, translate: bool) -> Result<()
     loop {
         frames += 1;
         let frame = async {
-            if head.poll(&mut arms).await? {
+            if head.poll(&mut arms).await?.iter().any(|&(_, gesture)| gesture == 1) {
                 head.tracker.position = [0.0; 3];
                 head.tracker.speed = [0.0; 3];
                 cube = Cube::ahead(&head.tracker.turn, head.tracker.position);
