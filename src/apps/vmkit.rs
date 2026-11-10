@@ -36,6 +36,7 @@ pub(crate) const R7: u16 = 7;
 pub(crate) const R8: u16 = 8;
 pub(crate) const R9: u16 = 9;
 pub(crate) const R10: u16 = 10;
+#[allow(dead_code)]
 pub(crate) const R11: u16 = 11;
 const R12: u16 = 12;
 const R13: u16 = 13;
@@ -202,10 +203,6 @@ impl Prog {
     /// The TIMER trigger at `at` (the arm's clock).
     pub fn timer(&mut self, at: u16) {
         self.set(prop::TIMER, at);
-    }
-
-    pub fn sleep_until(&mut self, at: u16) {
-        self.a.op(SLEEP_UNTIL, &[at]);
     }
 
     pub fn fill(&mut self, x: u16, y: u16, w: u16, h: u16, level: u16) {

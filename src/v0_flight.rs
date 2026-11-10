@@ -727,9 +727,9 @@ mod tests {
         assert!(LABELS + t.labels.len() as u32 <= LABEL_TEXT);
         assert!(LABEL_TEXT + t.text.len() as u32 <= HDG_DIGITS);
         // The state and its text slots, plus the call, sleep and draw, fit one packet.
-        assert!(5 + STATE_LEN + 4 + 11 + 4 <= 242);
+        const { assert!(5 + STATE_LEN + 4 + 11 + 4 <= 242) };
         assert!(TIMES >= STATE + STATE_LEN as u32 && (S_LADDER_RECT + 4) * 4 <= TEXTS - STATE);
-        assert!(WORK >= TIMES + 12 && WORK + WORK_WORDS * 4 <= LADDER);
+        const { assert!(WORK >= TIMES + 12 && WORK + WORK_WORDS * 4 <= LADDER) };
     }
 
     #[test]

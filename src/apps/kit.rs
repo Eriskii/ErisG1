@@ -14,7 +14,7 @@ use super::vmkit::{Program, TABLE};
 use crate::link::{self, Error};
 use crate::proto::Side;
 use crate::v0_cube::{self, EYES, FOCAL};
-use crate::v0_pinned::{Beat, Frame, Head, M, V, add, apply, scale, sub, transpose};
+use crate::v0_pinned::{Beat, Frame, Head, M, V, apply, sub, transpose};
 use crate::v5::{self, prop, trigger};
 use crate::v5_link::Arm;
 
@@ -51,8 +51,6 @@ pub(crate) struct Options {
     /// Levels (of 42) added to Even's light-to-brightness table.
     pub boost: u8,
 }
-
-pub(crate) const DEFAULT: Options = Options { font: 2, big: 0, imu: false, boost: 5 };
 
 /// A TouchBar gesture (VM.md §6.7), and the arm whose TouchBar it was.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,8 +109,6 @@ pub(crate) struct Eye {
     pub side: Side,
     /// The head's turn (head frame to the room's, `v0_pinned::Tracker`) when the frame appears, with `imu`.
     pub head: Option<M>,
-    /// When the frame appears, seconds since the app started.
-    pub t: f64,
 }
 
 impl Eye {
@@ -154,24 +150,6 @@ impl Eye {
     /// Where a point the eye sees (x right, y up, z ahead) lands on the panel, if it's in front.
     pub fn project(&self, p: V) -> Option<[f64; 2]> {
         (p[2] > 0.05).then(|| [CX + FOCAL * p[0] / p[2], CY - FOCAL * p[1] / p[2]])
-    }
-
-    /// A line between two points the eye sees, cut where it passes behind and clipped to the panel.
-    pub fn line(&self, canvas: &mut Canvas, a: V, b: V, level: u8) {
-        const NEAR: f64 = 0.05;
-        let (mut a, mut b) = (a, b);
-        if a[2] < NEAR && b[2] < NEAR {
-            return;
-        }
-        let cut = |p: V, q: V| add(p, scale(sub(q, p), (NEAR - p[2]) / (q[2] - p[2])));
-        if a[2] < NEAR {
-            a = cut(a, b);
-        } else if b[2] < NEAR {
-            b = cut(b, a);
-        }
-        if let (Some(p), Some(q)) = (self.project(a), self.project(b)) {
-            canvas.line_f(p, q, level);
-        }
     }
 }
 
@@ -493,13 +471,6 @@ impl Glasses {
         matches!(self.backend, Backend::Sim { .. })
     }
 
-    pub fn sides(&self) -> Vec<Side> {
-        match &self.backend {
-            Backend::Real { arms, .. } => arms.iter().map(|a| a.side).collect(),
-            Backend::Sim { world, .. } => world.arms.iter().map(|a| a.side).collect(),
-        }
-    }
-
     /// Seconds since the app started (in the simulator, its clock).
     pub fn now(&self) -> f64 {
         match &self.backend {
@@ -603,19 +574,17 @@ impl Glasses {
 
     /// Draws a frame: `draw` once for each eye, into its frame buffer; both eyes show it at the same moment.
     pub async fn frame(&mut self, mut draw: impl FnMut(&Eye, &mut Canvas)) -> Result<(), Error> {
-        let (font, big, boost, started) = (self.options.font, self.options.big, self.options.boost, self.started);
+        let (font, big, boost) = (self.options.font, self.options.big, self.options.boost);
         match &mut self.backend {
             Backend::Real { arms, beat, head, light, extra } => {
                 let due = beat.next_with(arms, *extra).await?;
                 let turn = head.as_ref().map(|h| h.at(due).0);
-                let ahead = (due.wrapping_sub(crate::v5_link::host_us()) as i32) as f64 / 1e6;
-                let t = started.elapsed().as_secs_f64() + ahead;
                 let mut bytes = 0;
                 let frames: Vec<Frame> = arms
                     .iter()
                     .map(|arm| {
                         let mut canvas = Canvas::new(font, big);
-                        draw(&Eye { side: arm.side, head: turn, t }, &mut canvas);
+                        draw(&Eye { side: arm.side, head: turn }, &mut canvas);
                         bytes = bytes.max(canvas.code.iter().chain(&canvas.show).map(Vec::len).sum::<usize>());
                         canvas.into_frame()
                     })
@@ -631,7 +600,7 @@ impl Glasses {
                 let turn = self.options.imu.then(|| head_turn((world.script().head)(t)));
                 for i in 0..world.arms.len() {
                     let mut canvas = Canvas::new(font, big);
-                    draw(&Eye { side: world.arms[i].side, head: turn, t }, &mut canvas);
+                    draw(&Eye { side: world.arms[i].side, head: turn }, &mut canvas);
                     let (mut code, show) = canvas.into_frame();
                     code.push(v5::sleep_until(world.device_time(i, due)));
                     code.extend(show);
@@ -794,7 +763,8 @@ mod tests {
 
     #[tokio::test]
     async fn draws_lists_of_lines_and_scrolls_in_the_simulator() {
-        let mut g = Glasses::open(Target::Sim(Script::still(1.0), None), DEFAULT).await.unwrap();
+        let options = Options { font: 2, big: 0, imu: false, boost: 5 };
+        let mut g = Glasses::open(Target::Sim(Script::still(1.0), None), options).await.unwrap();
         let many: Vec<([f64; 4], u8)> = (0..60).map(|i| ([10.0, 10.0 + i as f64, 100.0, 10.0 + i as f64], 9)).collect();
         g.frame(|_, c| {
             c.lines(&many);
@@ -816,8 +786,8 @@ mod tests {
 
     #[test]
     fn depth_splits_between_the_eyes() {
-        let left = Eye { side: Side::Left, head: None, t: 0.0 };
-        let right = Eye { side: Side::Right, head: None, t: 0.0 };
+        let left = Eye { side: Side::Left, head: None };
+        let right = Eye { side: Side::Right, head: None };
         // 1270 × 0.063 / 1 m ≈ 80 px in all.
         assert_eq!(left.depth(1.0) - right.depth(1.0), 80);
         assert!(left.depth(1.0) > 0 && right.depth(1.0) < 0);

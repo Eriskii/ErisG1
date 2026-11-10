@@ -287,7 +287,7 @@ mod tests {
         assert!(show > CODE && !code.is_empty() && !pool.is_empty());
         assert!(STATE + STATE_LEN as u32 <= FIXED_TEXT && FIXED_TEXT + 32 <= FIXED_AT && FIXED_AT + 12 <= CODE);
         // The state and the calls, a brightness change and the sleep fit one packet.
-        assert!(5 + STATE_LEN + 4 + 15 + 11 + 4 <= 242);
+        const { assert!(5 + STATE_LEN + 4 + 15 + 11 + 4 <= 242) };
     }
 
     #[test]

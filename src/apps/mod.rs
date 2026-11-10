@@ -8,8 +8,27 @@ pub(crate) mod kit;
 pub(crate) mod sim;
 pub(crate) mod vmkit;
 
+mod breathe;
+mod bricks;
+mod cards;
+mod dodge;
+mod fireworks;
+mod fun;
+mod metronome;
+mod note;
 mod notify;
+mod nowplaying;
+mod pomodoro;
+mod posture;
+mod power;
+mod prompter;
+mod run;
+mod sketch;
+mod steps;
 mod stopwatch;
+mod sysmon;
+mod warp;
+mod weather;
 
 use std::future::Future;
 use std::path::Path;
@@ -39,7 +58,28 @@ pub(crate) struct App {
 }
 
 pub(crate) fn all() -> Vec<App> {
-    vec![notify::APP, stopwatch::APP]
+    vec![
+        notify::APP,
+        run::APP,
+        sysmon::APP,
+        nowplaying::APP,
+        weather::APP,
+        power::APP,
+        stopwatch::APP,
+        pomodoro::APP,
+        posture::APP,
+        prompter::APP,
+        cards::APP,
+        note::APP,
+        steps::APP,
+        metronome::APP,
+        breathe::APP,
+        warp::APP,
+        dodge::APP,
+        bricks::APP,
+        sketch::APP,
+        fireworks::APP,
+    ]
 }
 
 fn find(name: &str) -> Result<App, Error> {

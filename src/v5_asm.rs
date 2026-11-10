@@ -1,6 +1,8 @@
 //! A builder for code that runs on a g1v0 arm (VM.md §2, §5): Rust calls, one per instruction, that come out as the
 //! arm's bytecode. Operands are arena words: r0–r14 are words 0–14, and every constant lives in a pool the builder
 //! fills as it goes, since the instructions take no immediate values.
+// The whole opcode table (VM.md §2.2) is here, whether a program uses each one yet or not.
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 

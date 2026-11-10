@@ -486,10 +486,10 @@ mod tests {
         assert!(CODE < r.text && r.text < r.show && r.show < r.show_text);
         assert!(!r.code.is_empty() && !r.pool.is_empty());
         // The state and its text slots, plus the four calls, a brightness change and the sleep, fit one packet.
-        assert!(5 + STATE_LEN + 4 * 4 + 15 + 11 <= 242);
+        const { assert!(5 + STATE_LEN + 4 * 4 + 15 + 11 <= 242) };
         assert!(T_BATTERY.0 + T_BATTERY.1 as u32 + TEXTS <= STATE + STATE_LEN as u32);
         assert!(LAST >= STATE + STATE_LEN as u32 && TIMES + 6 * 4 <= CODE);
-        assert!(S_BAR_LEVEL * 4 < TEXTS - STATE);
+        const { assert!(S_BAR_LEVEL * 4 < TEXTS - STATE) };
     }
 
     #[test]

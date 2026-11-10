@@ -617,9 +617,9 @@ mod tests {
     fn builds_and_fits() {
         let (code, _, show) = render_code().unwrap();
         assert!(show > CODE && CODE + code.len() as u32 <= IDLE);
-        assert!(LAST >= STATE + STATE_LEN as u32 && LAST + 96 <= CODE && RECT % 4 == 0);
+        assert!(LAST >= STATE + STATE_LEN as u32 && LAST + 96 <= CODE && RECT.is_multiple_of(4));
         // The state, the two calls, a brightness change and the sleep fit one packet.
-        assert!(5 + STATE_LEN + 4 + 15 + 11 + 4 <= 242);
+        const { assert!(5 + STATE_LEN + 4 + 15 + 11 + 4 <= 242) };
     }
 
     #[test]

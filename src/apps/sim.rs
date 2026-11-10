@@ -458,12 +458,6 @@ impl World {
     pub fn statuses(&self) -> Vec<(Side, [u8; 32])> {
         self.arms.iter().map(|a| (a.side, a.status())).collect()
     }
-
-    pub fn stop_all(&mut self) {
-        for i in 0..self.arms.len() {
-            self.stop(i);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -508,7 +502,7 @@ mod tests {
         world.write_preview(&path).unwrap();
         let mut reader = png::Decoder::new(std::fs::File::open(&path).unwrap()).read_info().unwrap();
         let frames = reader.info().animation_control.unwrap().num_frames;
-        assert!(frames >= 3 && frames < 10, "{frames}");
+        assert!((3..10).contains(&frames), "{frames}");
         let mut buf = vec![0; reader.output_buffer_size()];
         for _ in 0..frames {
             reader.next_frame(&mut buf).unwrap();

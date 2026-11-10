@@ -93,6 +93,42 @@ redrawn a region at a time, plus the accelerometer, gyroscope, TouchBar and ligh
 
 `--arm left|right` picks one arm; without it, every g1v0 arm in range.
 
+### Apps
+
+`erisg1 v0 apps` lists them, `erisg1 v0 app NAME [ARGS]` runs one on the glasses, and `erisg1 v0 preview NAME`
+(or `all`) runs it on two simulated arms instead, saving what each eye shows as `previews/NAME.png` (an animated PNG,
+both eyes side by side) and `previews/NAME.sheet.png` (eight moments of it). The simulator is scouter_kit's own VM
+core (MIT), compiled in by `build.rs` with `src/apps/sim.c`, on a virtual clock, with a script for the head, the
+TouchBars and the sensors and the arm-to-arm link between the arms. Gestures come from either arm's TouchBar.
+
+| App | Runs | What it does |
+|---|---|---|
+| `notify` | from the Mac | pop-up notifications from anything: `erisg1 v0 say [TITLE:] TEXT` while it runs; tap dismisses, double tap shows the last again |
+| `run -- CMD ARGS` | from the Mac | runs a command and watches it: its last lines, the time, then done or failed; tap switches to the summary. `run -- tail -f LOG` follows a log |
+| `sysmon` | from the Mac | the Mac's CPU (with a sparkline), memory, network, disk, battery and busiest process, every 2 s |
+| `nowplaying` | from the Mac | the track in Music or Spotify with its progress; tap play/pause, double tap next, triple tap previous |
+| `weather [--lat L --lon L]` | from the Mac | now, today and the next 12 hours from open-meteo (the place from ipinfo.io if not given) |
+| `power` | from the Mac | each arm's charge, voltage, current, temperature, time left, and a graph of the session |
+| `stopwatch` | on the glasses | laps: tap start/stop, double tap lap, hold reset |
+| `pomodoro [--work 25] [--rest 5]` | on the glasses | focus and break countdowns with a progress bar; tap pause, hold reset |
+| `posture [--minutes 3] [--every 20]` | on the glasses | dark until you've looked down too long ("chin up") or it's time for a 20-20-20 eye break |
+| `prompter FILE [--wpm 140]` | from the Mac | a teleprompter scrolling smoothly; tap pause, double tap faster, triple tap slower, hold back to the start |
+| `cards FILE` | from the Mac | flashcards, "front \| back" a line; tap turns over, double tap knew it, triple tap again |
+| `note TEXT...` | on the glasses | notes kept on the glasses (a door code, a wifi password): dark until a tap shows the next |
+| `steps` | on the glasses | pedometer: steps, steps a minute, distance; tap hides, hold resets |
+| `metronome [--bpm 100] [--beats 4]` | on the glasses | a beat flashing at exact times; tap tempo, double tap beats a bar, hold stops |
+| `breathe [--pattern 4-4-4-4]` | on the glasses | a square that grows and shrinks with your breathing; tap pause, hold switches pattern |
+| `warp` | from the Mac | fly through stars in 3D, steering with your head |
+| `dodge` | from the Mac | turn your head to dodge 3D rocks flying at you |
+| `bricks` | from the Mac | knock out a wall of bricks, the paddle moved by tilting your head |
+| `sketch` | from the Mac | draw with your head; the drawing is saved as a PNG when you stop |
+| `fireworks` | from the Mac | fireworks bursting in 3D at different distances; tap for another |
+
+An app driven from the Mac (`src/apps/kit.rs`, `Glasses::frame`) draws each eye's frame there and has both show it at
+the same moment, until Ctrl-C. One that runs on the glasses is a program built with `src/apps/vmkit.rs`, uploaded
+with `Glasses::deploy`: the Mac leaves once it starts and `v0 stop` ends it. TouchBar gestures on either arm reach
+the other over the arm-to-arm link, and both act on them at the same moment, 200 ms later.
+
 Both arms here run 0.5.60 with `firmware/patches/0001-ask-the-host-to-pair-in-the-case.patch`, built as 0.5.60+1.
 
 To build it, `firmware/scripts/setup.sh` puts NCS 2.5.1 (at the commits g1v0 was tested with), Zephyr SDK 0.16.5-1

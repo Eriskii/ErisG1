@@ -577,10 +577,10 @@ mod tests {
         assert_eq!(FRAMES, 480);
         assert_eq!(table(Side::Left).len() as u32, FRAMES * FRAME_BYTES);
         assert!(v5::FONT + v5::font(SCALE).len() as u32 <= TABLE);
-        assert!(TABLE + FRAMES * FRAME_BYTES <= POOL);
-        assert!(VAR_WORDS * 4 <= CUR - VARS && CUR + FRAME_BYTES <= LAST && LAST + 64 <= LAST_RECT);
-        assert!(LAST_RECT + 16 <= CLOCK_TEXT && CLOCK_TEXT + 11 <= BATT_TEXT && BATT_TEXT + 4 <= TRIGGERS);
-        assert!(TRIGGERS + 64 <= CODE);
+        const { assert!(TABLE + FRAMES * FRAME_BYTES <= POOL) };
+        const { assert!(VAR_WORDS * 4 <= CUR - VARS && CUR + FRAME_BYTES <= LAST && LAST + 64 <= LAST_RECT) };
+        const { assert!(LAST_RECT + 16 <= CLOCK_TEXT && CLOCK_TEXT + 11 <= BATT_TEXT && BATT_TEXT + 4 <= TRIGGERS) };
+        const { assert!(TRIGGERS + 64 <= CODE) };
     }
 
     #[test]
