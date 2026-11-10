@@ -45,12 +45,15 @@ pub(crate) struct Script {
     pub lux: f64,
     /// Each arm's battery, %.
     pub battery: [u32; 2],
+    /// The head's own acceleration at a time, mg, in the head frame (x right, y up, z back), on top of gravity:
+    /// walking, nodding.
+    pub accel: fn(f64) -> [f64; 3],
 }
 
 impl Script {
     /// `seconds` with the head still and nothing touched.
     pub fn still(seconds: f64) -> Script {
-        Script { seconds, touches: Vec::new(), head: |_| [0.0; 3], lux: 300.0, battery: [84, 87] }
+        Script { seconds, touches: Vec::new(), head: |_| [0.0; 3], lux: 300.0, battery: [84, 87], accel: |_| [0.0; 3] }
     }
 
     pub fn touch(mut self, at: f64, side: Side, gesture: u32) -> Script {
@@ -60,6 +63,11 @@ impl Script {
 
     pub fn head(mut self, head: fn(f64) -> [f64; 3]) -> Script {
         self.head = head;
+        self
+    }
+
+    pub fn accel(mut self, accel: fn(f64) -> [f64; 3]) -> Script {
+        self.accel = accel;
         self
     }
 }
@@ -230,6 +238,8 @@ impl World {
         let turn = head_turn((self.script.head)(t));
         // The accelerometer reads the way up, in the head frame; the gyroscope the turn since a moment ago.
         let up = crate::v0_pinned::apply(&transpose(&turn), [0.0, 1000.0, 0.0]);
+        let moved = (self.script.accel)(t);
+        let acc = [up[0] + moved[0], up[1] + moved[1], up[2] + moved[2]];
         let dt = 0.01;
         let before = head_turn((self.script.head)((t - dt).max(0.0)));
         let rate = scale(log(&mul(&transpose(&before), &turn)), (180.0 / std::f64::consts::PI) * 1000.0 / dt);
@@ -238,7 +248,7 @@ impl World {
         let (lux, battery) = (self.script.lux, self.script.battery);
         for arm in &mut self.arms {
             let right = arm.side == Side::Right;
-            for (id, v) in [(prop::ACC_X, up[0]), (prop::ACC_Y, up[1]), (prop::ACC_Z, up[2])] {
+            for (id, v) in [(prop::ACC_X, acc[0]), (prop::ACC_Y, acc[1]), (prop::ACC_Z, acc[2])] {
                 arm.set(id, v.round() as i32 as u32);
             }
             if arm.get(prop::GYRO_RATE) != 0 {

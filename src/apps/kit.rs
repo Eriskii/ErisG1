@@ -22,6 +22,12 @@ use crate::v5_link::Arm;
 pub(crate) const BIG_FONT: u32 = 0x29000;
 /// The do-nothing program that keeps the right arm's light sensor reading while the Mac draws.
 const IDLE: u32 = 0x3F000;
+/// The kit's routine that draws a list of lines (`Canvas::lines`), its constants, and the list's buffer.
+const LINES_POOL: u32 = 0x3E000;
+const LINES_CODE: u32 = 0x3E040;
+const LINES_LIST: u32 = 0x3E200;
+/// Lines per list: 9 bytes each in one WRITE that fits a packet.
+const LINES_CHUNK: usize = 25;
 /// Arena words the kit keeps for drawing: frame, stride, main font, text mode (v5::fixed_args), then the big font.
 const W_FRAME: u16 = 16;
 const W_STRIDE: u16 = 17;
@@ -310,6 +316,50 @@ impl Canvas {
         self.show(0, 0, v5::WIDTH as i32, v5::HEIGHT as i32);
     }
 
+    /// Many lines at once, each (x0, y0, x1, y1) and a level: 9 bytes a line on the link instead of about 25, so
+    /// about 25 lines fit a packet. Clipped to the panel.
+    pub fn lines(&mut self, lines: &[([f64; 4], u8)]) {
+        let mut list: Vec<u8> = Vec::new();
+        let mut n = 0;
+        let flush = |c: &mut Canvas, list: &mut Vec<u8>, n: &mut usize| {
+            if *n > 0 {
+                c.code.push(v5::write(LINES_LIST, list));
+                let mut call = regs(&[LINES_LIST as i32, *n as i32]);
+                call.extend(v5::call(LINES_CODE));
+                c.code.push(call);
+            }
+            list.clear();
+            *n = 0;
+        };
+        for &([x0, y0, x1, y1], level) in lines {
+            if ![x0, y0, x1, y1].iter().all(|v| v.is_finite() && v.abs() < 30000.0) {
+                continue;
+            }
+            let Some(ends) = v0_cube::clip([x0, y0], [x1, y1]) else { continue };
+            for v in ends {
+                list.extend((v as u16).to_le_bytes());
+            }
+            list.push(level.min(15));
+            n += 1;
+            if n == LINES_CHUNK {
+                flush(self, &mut list, &mut n);
+            }
+        }
+        flush(self, &mut list, &mut n);
+    }
+
+    /// Copies w × h of the frame from x, y to `to` (overlapping is fine): to scroll a part of it.
+    pub fn blit(&mut self, x: i32, y: i32, w: i32, h: i32, to: [i32; 2]) {
+        let fits = |x: i32, y: i32| Canvas::clamp(x, y, w, h) == Some([x, y, w, h]);
+        if w <= 0 || h <= 0 || !fits(x, y) || !fits(to[0], to[1]) {
+            return;
+        }
+        // BLIT src, src_stride, src_x, src_y, dst, dst_stride, dst_x, dst_y, w, h, mode (copy), level.
+        let mut c = regs(&[x, y, to[0], to[1], w, h, 0, 15]);
+        c.extend(v5::encode(0x51, &[W_FRAME, W_STRIDE, 0, 1, W_FRAME, W_STRIDE, 2, 3, 4, 5, 6, 7], &[]));
+        self.code.push(c);
+    }
+
     fn into_frame(self) -> Frame {
         (self.code, self.show)
     }
@@ -323,9 +373,36 @@ fn setup(options: &Options) -> Vec<Vec<u8>> {
     }
     code.push(v5::fixed_args());
     code.push(v5::write(W_BIG as u32 * 4, &BIG_FONT.to_le_bytes()));
+    let (lines, pool) = lines_routine();
+    code.extend(v5::upload(LINES_POOL, &pool, 200));
+    code.extend(v5::upload(LINES_CODE, &lines, 200));
     code.push(v5::fill(0, 0, v5::WIDTH, v5::HEIGHT, 0));
     code.push(v5::draw(0, 0, v5::WIDTH, v5::HEIGHT));
     code
+}
+
+/// The routine `Canvas::lines` calls: r0 the list's address, r1 how many lines (x0, y0, x1, y1 as u16, then a
+/// level byte, each).
+fn lines_routine() -> (Vec<u8>, Vec<u8>) {
+    use crate::v5_asm::*;
+    let mut a = Asm::new(LINES_CODE, LINES_POOL);
+    let [zero, one, two, three, eight, nine] = [0, 1, 2, 3, 8, 9].map(|v| a.k(v));
+    a.label("next");
+    a.branch(BEQ, 1, zero, "done");
+    a.op(LD16, &[2, 0, zero]);
+    a.op(LD16, &[3, 0, one]);
+    a.op(LD16, &[4, 0, two]);
+    a.op(LD16, &[5, 0, three]);
+    a.op(LD8, &[6, 0, eight]);
+    a.op(LINE, &[W_FRAME, W_STRIDE, 2, 3, 4, 5, 6]);
+    a.op(ADD, &[0, 0, nine]);
+    a.op(SUB, &[1, 1, one]);
+    a.jump(JMP, "next");
+    a.label("done");
+    a.op(RET, &[]);
+    let (code, pool) = a.finish().expect("the lines routine assembles");
+    assert!(LINES_POOL + pool.len() as u32 <= LINES_CODE && LINES_CODE + code.len() as u32 <= LINES_LIST);
+    (code, pool)
 }
 
 /// The do-nothing program (`v0_sensors::start_idle_program`) as host code and its table.
@@ -577,6 +654,23 @@ impl Glasses {
         self.check()
     }
 
+    /// Properties (`v5::prop`) of each arm, as `PROPS` reads them (VM.md §2.5): sensors, battery, case. On the
+    /// glasses it waits for the answers (tens of ms): read a few seconds apart.
+    pub async fn props(&mut self, ids: &[u8]) -> Result<Vec<(Side, Vec<u32>)>, Error> {
+        match &mut self.backend {
+            Backend::Real { arms, .. } => {
+                let mut out = Vec::new();
+                for arm in arms.iter_mut() {
+                    out.push((arm.side, arm.props(ids).await?));
+                }
+                Ok(out)
+            }
+            Backend::Sim { world, .. } => {
+                Ok(world.arms.iter().map(|a| (a.side, ids.iter().map(|&id| a.get(id)).collect())).collect())
+            }
+        }
+    }
+
     /// Puts the panel in standby (dark, about 1 mA) until the next frame shows something.
     pub async fn sleep_panel(&mut self) -> Result<(), Error> {
         match &mut self.backend {
@@ -694,6 +788,28 @@ mod tests {
         c.fill(630, 470, 50, 50, 15);
         c.text(600, 10, "edge", 15);
         assert_eq!(c.code.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn draws_lists_of_lines_and_scrolls_in_the_simulator() {
+        let mut g = Glasses::open(Target::Sim(Script::still(1.0), None), DEFAULT).await.unwrap();
+        let many: Vec<([f64; 4], u8)> = (0..60).map(|i| ([10.0, 10.0 + i as f64, 100.0, 10.0 + i as f64], 9)).collect();
+        g.frame(|_, c| {
+            c.lines(&many);
+            c.blit(10, 10, 91, 60, [200, 300]);
+            c.show_all();
+        })
+        .await
+        .unwrap();
+        g.wait(0.1).await.unwrap();
+        let Backend::Sim { world, .. } = &g.backend else { unreachable!() };
+        for arm in &world.arms {
+            let panel = arm.panel().unwrap();
+            assert_eq!(panel[69 * 640 + 50], 9, "the 60th line");
+            assert_eq!(panel[70 * 640 + 50], 0);
+            assert_eq!(panel[(300 + 59) * 640 + 240], 9, "its copy");
+        }
+        g.close().await.unwrap();
     }
 
     #[test]
