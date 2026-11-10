@@ -9,7 +9,7 @@ use crate::v5::{self, prop, trigger};
 use crate::v5_link::{self, Arm, side_name};
 
 /// Connects to the arm on `side`, or to every g1v0 arm in range.
-async fn arms(side: Option<Side>) -> Result<Vec<Arm>, Error> {
+pub(crate) async fn arms(side: Option<Side>) -> Result<Vec<Arm>, Error> {
     let adapter = link::adapter().await?;
     let wanted = match side {
         Some(side) => vec![side],
@@ -176,7 +176,7 @@ pub async fn test(side: Option<Side>) -> Result<(), Error> {
     Ok(())
 }
 
-async fn upload_font(arm: &mut Arm, scale: u8) -> Result<(), Error> {
+pub(crate) async fn upload_font(arm: &mut Arm, scale: u8) -> Result<(), Error> {
     let font = v5::font(scale);
     let parts = v5::upload(v5::FONT, &font, arm.max_code);
     arm.run(parts).await?;

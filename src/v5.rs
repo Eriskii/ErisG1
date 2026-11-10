@@ -63,9 +63,15 @@ pub fn write(addr: u32, data: &[u8]) -> Vec<u8> {
 /// Instruction `op` with arena words `words` as its operands: one nibble each, words 15 and up escaped to a u16
 /// after the nibbles (§2.1).
 fn instruction(op: u8, words: &[u16]) -> Vec<u8> {
+    encode(op, words, &[])
+}
+
+/// Instruction `op`: the operand nibbles for `words`, then `literal` (a jump target), then the escaped words (§2.1).
+pub fn encode(op: u8, words: &[u16], literal: &[u8]) -> Vec<u8> {
     let nibbles: Vec<u8> = words.iter().map(|&w| w.min(15) as u8).collect();
     let mut code = vec![op];
     code.extend(nibbles.chunks(2).map(|pair| pair[0] << 4 | pair.get(1).copied().unwrap_or(0)));
+    code.extend_from_slice(literal);
     for &w in words.iter().filter(|&&w| w >= 15) {
         code.extend(w.to_le_bytes());
     }
@@ -143,6 +149,9 @@ pub mod ctrl {
     pub const REBOOT: u8 = 0x08;
     pub const PROPS: u8 = 0x0A;
     pub const PANEL_READ: u8 = 0x0B;
+    pub const VM_START: u8 = 0x10;
+    pub const VM_STOP: u8 = 0x11;
+    pub const VM_STATUS: u8 = 0x12;
     pub const EVENTS: u8 = 0x14;
 }
 
@@ -155,11 +164,13 @@ pub fn control(op: u8, tag: u8, body: &[u8]) -> Vec<u8> {
 
 /// Properties (§2.5).
 pub mod prop {
+    pub const TIME_US: u8 = 0x00;
     pub const LINK_INTERVAL: u8 = 0x05;
     pub const BATT_MV: u8 = 0x10;
     pub const BATT_PCT: u8 = 0x11;
     pub const CHARGE: u8 = 0x12;
     pub const WORN: u8 = 0x14;
+    pub const BATT_MA: u8 = 0x15;
     pub const BATT_TEMP: u8 = 0x16;
     pub const ACC_X: u8 = 0x18;
     pub const ACC_Y: u8 = 0x19;
@@ -169,12 +180,14 @@ pub mod prop {
     pub const ROLL: u8 = 0x1D;
     pub const BRIGHTNESS: u8 = 0x20;
     pub const PANEL: u8 = 0x21;
+    pub const TIMER: u8 = 0x22;
     pub const IMU_RATE: u8 = 0x28;
     pub const BRIGHTNESS_CAP: u8 = 0x2A;
     pub const GYR_X: u8 = 0x30;
     pub const GYR_Y: u8 = 0x31;
     pub const GYR_Z: u8 = 0x32;
     pub const GYRO_RATE: u8 = 0x33;
+    pub const TOUCH_GESTURE: u8 = 0x34;
     pub const AUTO_BRIGHTNESS: u8 = 0x38;
 }
 
@@ -249,12 +262,45 @@ pub struct Event {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum EventKind {
-    Ack { rx_next: u16, exec_next: u16, credits: u8, sack: u32 },
-    Error { seq: u16, offset: u8, op: u8, code: u8, detail: u32 },
-    Notify { count: u16, a: u32, b: u32 },
-    Notice { kind: u8, body: Vec<u8> },
-    Input { trigger: u8, value: u32 },
-    Reply { op: u8, tag: u8, status: u8, body: Vec<u8> },
+    Ack {
+        rx_next: u16,
+        exec_next: u16,
+        credits: u8,
+        sack: u32,
+    },
+    Error {
+        seq: u16,
+        offset: u8,
+        op: u8,
+        code: u8,
+        detail: u32,
+    },
+    /// A program stopped on an error.
+    Halt {
+        address: u32,
+        op: u8,
+        code: u8,
+        detail: u32,
+    },
+    Notify {
+        count: u16,
+        a: u32,
+        b: u32,
+    },
+    Notice {
+        kind: u8,
+        body: Vec<u8>,
+    },
+    Input {
+        trigger: u8,
+        value: u32,
+    },
+    Reply {
+        op: u8,
+        tag: u8,
+        status: u8,
+        body: Vec<u8>,
+    },
     Other(u8),
 }
 
@@ -274,6 +320,7 @@ pub fn event(data: &[u8]) -> Option<Event> {
             code: *data.get(13)?,
             detail: u32_at(14)?,
         },
+        0x03 => EventKind::Halt { address: u32_at(10)?, op: *data.get(14)?, code: *data.get(15)?, detail: u32_at(16)? },
         0x04 => EventKind::Notify { count: u16_at(9)?, a: u32_at(12)?, b: u32_at(16)? },
         0x05 => EventKind::Notice { kind: *data.get(9)?, body: data[10..].to_vec() },
         0x07 => EventKind::Input { trigger: *data.get(11)?, value: u32_at(12)? },
