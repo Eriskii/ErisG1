@@ -1,6 +1,10 @@
 //! `power`: the glasses' own batteries, every 5 s: for each arm its charge, voltage, current, temperature and
-//! whether it's charging, how long its charge lasts at the present current (an 80 mAh cell), and a graph of both
-//! charges since the app started. Tap either TouchBar to put the panel to sleep or wake it.
+//! whether it's charging, how long its charge will last, and a graph of both charges since the app started. Tap
+//! either TouchBar to put the panel to sleep or wake it.
+//!
+//! The time left comes from how fast the charge has been falling, once it has fallen for long enough to tell
+//! (`estimate`). Until then it's a range from the average current: the arms draw a few mA, about as much as the
+//! battery chip's reading can be off by, so the present current alone can be out by half.
 
 use super::kit::{Canvas, Gesture, Glasses, Options};
 use super::sim::Script;
@@ -26,6 +30,13 @@ fn demo() -> Script {
 const EVERY: f64 = 5.0;
 /// Each arm's cell, mAh.
 const CELL: f64 = 80.0;
+/// How far back the fall of the charge is measured, how long and how far it must have fallen to be used (s, %).
+const TREND_WINDOW: f64 = 1800.0;
+const TREND_SPAN: f64 = 600.0;
+const TREND_DROP: u32 = 2;
+/// How long the current is averaged over (s), and how far the average may be off either way (mA).
+const CURRENT_WINDOW: f64 = 600.0;
+const CURRENT_ERROR: f64 = 3.0;
 const IDS: [u8; 6] = [prop::BATT_PCT, prop::BATT_MV, prop::BATT_MA, prop::BATT_TEMP, prop::CHARGE, prop::IN_CASE];
 /// The columns' left edges: the left arm's, the right's.
 const COLUMNS: [i32; 2] = [40, 360];
@@ -58,9 +69,9 @@ impl Reading {
         }
     }
 
-    /// The column's lines under the big %: volts and current, temperature, state, time left (17 characters at
-    /// most, to fit a column).
-    fn lines(&self) -> [String; 4] {
+    /// The column's lines under the big %: volts and current, temperature, state, and `left`, the time left (17
+    /// characters at most, to fit a column).
+    fn lines(&self, left: String) -> [String; 4] {
         let volts = self.mv.map_or("? V".into(), |mv| format!("{:.2} V", mv as f64 / 1000.0));
         let amps = self.ma.map_or("? mA".into(), |ma| format!("{ma} mA"));
         let temp = self.temp.map_or("? C".into(), |t| format!("{:.1} C", t as f64 / 10.0));
@@ -70,20 +81,43 @@ impl Reading {
             (_, true) => "in the case",
             _ => "on battery",
         };
-        [format!("{volts}  {amps}"), temp, state.to_string(), left(self.pct, self.ma)]
+        [format!("{volts}  {amps}"), temp, state.to_string(), left]
     }
 }
 
-/// How long a charge of `pct` % lasts at `ma` mA from an 80 mAh cell.
-fn left(pct: Option<u32>, ma: Option<i32>) -> String {
-    match (pct, ma) {
-        (Some(pct), Some(ma)) if ma > 0 => {
-            let minutes = (CELL * pct as f64 / 100.0 / ma as f64 * 60.0).round() as u32;
-            format!("{} h {:02} min left", minutes / 60, minutes % 60)
-        }
-        (_, Some(ma)) if ma < 0 => "taking charge".into(),
-        _ => "time left ?".into(),
+/// One reading of an arm: when (s), its charge (%) and its current (mA).
+type Sample = (f64, Option<u32>, Option<i32>);
+
+/// How long the arm's charge will last, from its samples: from the fall of the charge over the last half hour
+/// once it has fallen for ten minutes and by two points (the charge moves in steps of 1% held for 30 s); before
+/// that, a range from the average current of the last ten minutes, ± CURRENT_ERROR.
+fn estimate(samples: &[Sample]) -> String {
+    let Some(&(now, Some(pct), ma)) = samples.last() else { return "time left ?".into() };
+    if ma.is_some_and(|ma| ma < 0) {
+        return "taking charge".into();
     }
+    let recent: Vec<(f64, u32)> =
+        samples.iter().filter(|s| s.0 >= now - TREND_WINDOW).filter_map(|s| Some((s.0, s.1?))).collect();
+    if let (Some(&(t0, p0)), Some(&(t1, p1))) = (recent.first(), recent.last())
+        && t1 - t0 >= TREND_SPAN
+        && p0 >= p1 + TREND_DROP
+    {
+        let per_second = (p0 - p1) as f64 / (t1 - t0);
+        let minutes = (pct as f64 / per_second / 60.0).round() as u32;
+        return format!("{} h {:02} min left", minutes / 60, minutes % 60);
+    }
+    let currents: Vec<f64> = samples
+        .iter()
+        .filter(|s| s.0 >= now - CURRENT_WINDOW)
+        .filter_map(|s| s.2.filter(|&ma| ma > 0).map(|ma| ma as f64))
+        .collect();
+    if currents.is_empty() {
+        return "time left ?".into();
+    }
+    let average = currents.iter().sum::<f64>() / currents.len() as f64;
+    let hours = |ma: f64| CELL * pct as f64 / 100.0 / ma;
+    let (least, most) = (hours(average + CURRENT_ERROR), hours((average - CURRENT_ERROR).max(1.0)));
+    format!("{:.0} to {:.0} h left", least.floor().max(0.0), most.ceil())
 }
 
 /// Points drawn on the graph at most, however long the session: each costs the link 9 bytes a line.
@@ -140,6 +174,7 @@ fn run<'a>(g: &'a mut Glasses, _args: &'a [String]) -> Running<'a> {
     Box::pin(async move {
         let started = g.now();
         let mut history: Vec<(f64, [Option<u32>; 2])> = Vec::new();
+        let mut samples: [Vec<Sample>; 2] = [Vec::new(), Vec::new()];
         let (mut shown, mut awake, mut next) = (Shown::default(), true, g.now());
         g.frame(|_, c| draw_static(c)).await?;
         while g.running() {
@@ -161,9 +196,14 @@ fn run<'a>(g: &'a mut Glasses, _args: &'a [String]) -> Running<'a> {
                 for (side, values) in g.props(&IDS).await? {
                     readings[(side == Side::Right) as usize] = Reading::from(&values);
                 }
-                history.push((g.now() - started, readings.map(|r| r.pct)));
+                let t = g.now() - started;
+                history.push((t, readings.map(|r| r.pct)));
+                for (arm, r) in samples.iter_mut().zip(&readings) {
+                    arm.push((t, r.pct, r.ma));
+                }
+                let left = [estimate(&samples[0]), estimate(&samples[1])];
                 if awake {
-                    draw(g, &readings, &history, g.now() - started, &mut shown).await?;
+                    draw(g, &readings, &left, &history, t, &mut shown).await?;
                 }
             }
             g.wait(0.2).await?;
@@ -175,11 +215,17 @@ fn run<'a>(g: &'a mut Glasses, _args: &'a [String]) -> Running<'a> {
 async fn draw(
     g: &mut Glasses,
     readings: &[Reading; 2],
+    left: &[String; 2],
     history: &[(f64, [Option<u32>; 2])],
     elapsed: f64,
     shown: &mut Shown,
 ) -> Result<(), Error> {
-    let columns = readings.map(|r| Some((r.pct.map_or("?".into(), |p| format!("{p}%")), r.lines())));
+    let columns: Vec<Option<(String, [String; 4])>> = readings
+        .iter()
+        .zip(left)
+        .map(|(r, left)| Some((r.pct.map_or("?".into(), |p| format!("{p}%")), r.lines(left.clone()))))
+        .collect();
+    let columns: [Option<(String, [String; 4])>; 2] = [columns[0].clone(), columns[1].clone()];
     let (lines, lo, hi) = graph(history);
     let old = std::mem::take(&mut shown.columns);
     let clock = chrono::Local::now().format("%H:%M").to_string();
@@ -226,11 +272,24 @@ mod tests {
     #[test]
     fn reads_and_estimates() {
         let r = Reading::from(&[84, 3972, 38, 284, 0, 0]);
-        assert_eq!(r.lines(), ["3.97 V  38 mA", "28.4 C", "on battery", "1 h 46 min left"]);
-        assert!(r.lines().iter().all(|l| l.len() <= 17));
+        assert_eq!(r.lines("1 h 46 min left".into()), ["3.97 V  38 mA", "28.4 C", "on battery", "1 h 46 min left"]);
         assert_eq!(Reading::from(&[v5::UNKNOWN; 6]).pct, None);
-        assert_eq!(left(Some(50), Some(-20)), "taking charge");
         assert_eq!(session(3900.0), "1 h 05 min");
+    }
+
+    #[test]
+    fn estimates_from_the_trend_once_it_can() {
+        // 9 mA at 100%: 80 / 12 to 80 / 6 hours while settling.
+        let settling: Vec<_> = (0..20).map(|i| (i as f64 * 5.0, Some(100), Some(9))).collect();
+        assert_eq!(estimate(&settling), "6 to 14 h left");
+        // 90% to 86% over 20 minutes: 86 / (4 / 1200 s) = 7 h 10 min, whatever the current says.
+        let falling: Vec<_> = (0..=240).map(|i| (i as f64 * 5.0, Some(90 - (i as u32 * 4) / 240), Some(30))).collect();
+        assert_eq!(estimate(&falling), "7 h 10 min left");
+        assert_eq!(estimate(&[(0.0, Some(50), Some(-20))]), "taking charge");
+        assert_eq!(estimate(&[(0.0, None, Some(5))]), "time left ?");
+        for text in [estimate(&settling), estimate(&falling)] {
+            assert!(text.len() <= 17, "{text}");
+        }
     }
 
     #[test]
