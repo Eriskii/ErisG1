@@ -409,17 +409,49 @@ impl World {
         encoder.set_color(png::ColorType::Indexed);
         encoder.set_depth(png::BitDepth::Four);
         encoder.set_palette(palette());
-        let frames = self.stills.len().max(1) as u32;
-        encoder.set_animated(frames, 0).map_err(|e| e.to_string())?;
-        encoder.set_frame_delay(1, (1_000_000 / self.still_every) as u16).map_err(|e| e.to_string())?;
-        let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
+        // Runs of the same picture as one frame shown longer, and after the first only the rectangle that changed.
         let blank = Still { pixels: vec![0; (w * h) as usize] };
-        let stills: Vec<&Still> = if self.stills.is_empty() { vec![&blank] } else { self.stills.iter().collect() };
-        for still in stills {
-            let packed: Vec<u8> = still.pixels.chunks(2).map(|p| p[0] << 4 | p.get(1).copied().unwrap_or(0)).collect();
-            writer.write_image_data(&packed).map_err(|e| e.to_string())?;
+        let mut runs: Vec<(&Still, u32)> = Vec::new();
+        for still in if self.stills.is_empty() { vec![&blank] } else { self.stills.iter().collect() } {
+            match runs.last_mut() {
+                Some((last, n)) if last.pixels == still.pixels => *n += 1,
+                _ => runs.push((still, 1)),
+            }
         }
-        writer.finish().map_err(|e| e.to_string())
+        let delay_ms = (self.still_every / 1000) as u32;
+        let e = |e: png::EncodingError| e.to_string();
+        encoder.set_animated(runs.len() as u32, 0).map_err(e)?;
+        let mut writer = encoder.write_header().map_err(e)?;
+        writer.set_blend_op(png::BlendOp::Source).map_err(e)?;
+        writer.set_dispose_op(png::DisposeOp::None).map_err(e)?;
+        let (w, h) = (w as usize, h as usize);
+        let mut before: Option<&Still> = None;
+        for &(still, n) in &runs {
+            writer.set_frame_delay((n * delay_ms).min(65_535) as u16, 1000).map_err(e)?;
+            let [x0, y0, x1, y1] = match before {
+                None => [0, 0, w, h],
+                Some(b) => {
+                    let differs = |i: usize| b.pixels[i] != still.pixels[i];
+                    let rows: Vec<usize> = (0..h).filter(|&y| (0..w).any(|x| differs(y * w + x))).collect();
+                    let cols: Vec<usize> = (0..w).filter(|&x| rows.iter().any(|&y| differs(y * w + x))).collect();
+                    match (rows.first(), rows.last(), cols.first(), cols.last()) {
+                        (Some(&y0), Some(&y1), Some(&x0), Some(&x1)) => [x0, y0, x1 + 1, y1 + 1],
+                        _ => [0, 0, 1, 1],
+                    }
+                }
+            };
+            writer.reset_frame_position().map_err(e)?;
+            writer.set_frame_dimension((x1 - x0) as u32, (y1 - y0) as u32).map_err(e)?;
+            writer.set_frame_position(x0 as u32, y0 as u32).map_err(e)?;
+            let mut packed = Vec::with_capacity((x1 - x0).div_ceil(2) * (y1 - y0));
+            for y in y0..y1 {
+                let row = &still.pixels[y * w + x0..y * w + x1];
+                packed.extend(row.chunks(2).map(|p| p[0] << 4 | p.get(1).copied().unwrap_or(0)));
+            }
+            writer.write_image_data(&packed).map_err(e)?;
+            before = Some(still);
+        }
+        writer.finish().map_err(e)
     }
 
     /// Each arm's VM_STATUS, to check that its program runs.
@@ -456,6 +488,32 @@ mod tests {
         assert_eq!(world.arms[0].get(prop::PEER_MSG), 77);
         let t = world.arms[0].get(prop::PEER_T_US);
         assert!((world.world_time(0, t) as i64 - sent as i64).abs() < 10_000);
+    }
+
+    #[test]
+    fn previews_decode_frame_by_frame() {
+        let mut world = World::new(&[Side::Left, Side::Right], Script::still(1.0), 10);
+        for (i, x) in [10, 200, 200, 400].into_iter().enumerate() {
+            for arm in 0..2 {
+                world.push(
+                    arm,
+                    vec![
+                        [v5::fill(0, 0, 640, 480, 0), v5::fill(x, 100, 30, 30, 15), v5::draw(0, 0, 640, 480)].concat(),
+                    ],
+                );
+            }
+            world.run_to((i as u64 + 1) * 200_000);
+        }
+        let path = std::env::temp_dir().join("erisg1-preview-test.png");
+        world.write_preview(&path).unwrap();
+        let mut reader = png::Decoder::new(std::fs::File::open(&path).unwrap()).read_info().unwrap();
+        let frames = reader.info().animation_control.unwrap().num_frames;
+        assert!(frames >= 3 && frames < 10, "{frames}");
+        let mut buf = vec![0; reader.output_buffer_size()];
+        for _ in 0..frames {
+            reader.next_frame(&mut buf).unwrap();
+        }
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

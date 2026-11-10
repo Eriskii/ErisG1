@@ -405,7 +405,8 @@ impl Head {
     /// and then too). Returns the TouchBar gestures since the last call: the arm and the gesture (VM.md §6.7).
     pub(crate) async fn poll(&mut self, arms: &mut [Arm]) -> Result<Vec<(Side, u32)>, Error> {
         self.asked += 1;
-        let (mut fresh, mut gestures): (Vec<(V, V)>, Vec<(Side, u32)>) = (Vec::new(), Vec::new());
+        let mut fresh: Vec<(V, V)> = Vec::new();
+        let mut gestures: Vec<(Side, u32)> = Vec::new();
         for (i, (arm, read)) in arms.iter_mut().zip(&mut self.reads).enumerate() {
             arm.poll().await?;
             if let Some((tag, ids, _)) = read

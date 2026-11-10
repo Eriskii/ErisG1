@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use super::sim::{Script, World, head_turn};
-use super::vmkit::{Init, Program, TABLE};
+use super::vmkit::{Program, TABLE};
 use crate::link::{self, Error};
 use crate::proto::Side;
 use crate::v0_cube::{self, EYES, FOCAL};
@@ -132,12 +132,14 @@ impl Eye {
         }
     }
 
+    #[allow(clippy::wrong_self_convention)]
     /// A point given relative to the middle of the head (metres: x right, y up, z ahead) as this eye sees it: x
     /// right, y up, z ahead of the eye.
     pub fn from_head(&self, p: V) -> V {
         [p[0] - self.x(), p[1], p[2]]
     }
 
+    #[allow(clippy::wrong_self_convention)]
     /// A point in the room (the head frame at the start: x right, y up, z back) as this eye sees it now: x right,
     /// y up, z ahead. Without `imu`, the head never turns.
     pub fn from_room(&self, p: V) -> V {

@@ -261,6 +261,7 @@ impl Prog {
     }
 
     /// `n` glyphs of the buffer at `buf` (+ `from`), the top left at x, `top`.
+    #[allow(clippy::too_many_arguments)]
     pub fn text_k(&mut self, font: Font, x: i32, top: i32, buf: u32, from: u32, n: u32, level: u8) {
         let size = self.size(font);
         assert!(top >= 0 && top + size <= v5::HEIGHT as i32, "text off the panel's rows");
