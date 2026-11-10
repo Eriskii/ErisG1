@@ -20,7 +20,7 @@ use crate::proto::Side;
 use crate::v0_cube::{self, HALF_SIDE};
 use crate::v5::{self, prop, trigger};
 use crate::v5_asm::*;
-use crate::v5_link;
+use crate::v5_link::{self, Arm};
 
 const POOL: u32 = 0x30000;
 /// Written every frame: the edges (x0, y0, x1, y1 as u16), their levels (u8), then the rectangle (x, y, w, h) that
@@ -49,55 +49,58 @@ const CALIBRATE: Duration = Duration::from_millis(1500);
 const READING_AGE: f64 = 0.03;
 /// Gravity's pull on pitch and roll, per reading, while the accelerometer reads about 1 g.
 const LEVELLING: f64 = 0.02;
+/// The share of the way the rate used to predict moves toward each new reading: a little smoothing for the
+/// readings' noise, which predicting a tenth of a second ahead magnifies, without missing a turn's start.
+const RATE_SMOOTHING: f64 = 0.7;
 /// How fast speed and position leak back to zero (s), and the acceleration taken as none (m/s²).
 const SPEED_LEAK: f64 = 0.4;
 const POSITION_LEAK: f64 = 1.5;
 const STILL: f64 = 0.2;
 const G: f64 = 9.81;
 
-type V = [f64; 3];
-type M = [[f64; 3]; 3];
+pub(crate) type V = [f64; 3];
+pub(crate) type M = [[f64; 3]; 3];
 
 const IDENTITY: M = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 
-fn add(a: V, b: V) -> V {
+pub(crate) fn add(a: V, b: V) -> V {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 }
 
-fn sub(a: V, b: V) -> V {
+pub(crate) fn sub(a: V, b: V) -> V {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
-fn scale(a: V, s: f64) -> V {
+pub(crate) fn scale(a: V, s: f64) -> V {
     a.map(|v| v * s)
 }
 
-fn dot(a: V, b: V) -> f64 {
+pub(crate) fn dot(a: V, b: V) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
-fn cross(a: V, b: V) -> V {
+pub(crate) fn cross(a: V, b: V) -> V {
     [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
 }
 
-fn norm(a: V) -> f64 {
+pub(crate) fn norm(a: V) -> f64 {
     dot(a, a).sqrt()
 }
 
-fn apply(m: &M, v: V) -> V {
+pub(crate) fn apply(m: &M, v: V) -> V {
     [dot(m[0], v), dot(m[1], v), dot(m[2], v)]
 }
 
-fn mul(a: &M, b: &M) -> M {
+pub(crate) fn mul(a: &M, b: &M) -> M {
     std::array::from_fn(|i| std::array::from_fn(|j| (0..3).map(|k| a[i][k] * b[k][j]).sum()))
 }
 
-fn transpose(m: &M) -> M {
+pub(crate) fn transpose(m: &M) -> M {
     std::array::from_fn(|i| std::array::from_fn(|j| m[j][i]))
 }
 
 /// The rotation by |w| radians about w (Rodrigues).
-fn exp(w: V) -> M {
+pub(crate) fn exp(w: V) -> M {
     let angle = norm(w);
     if angle < 1e-12 {
         return IDENTITY;
@@ -109,15 +112,25 @@ fn exp(w: V) -> M {
     std::array::from_fn(|i| std::array::from_fn(|j| IDENTITY[i][j] + s * k[i][j] + (1.0 - c) * k2[i][j]))
 }
 
+/// The rotation vector of `m`: the axis, as long as the angle in radians (the inverse of `exp`, for angles below π).
+pub(crate) fn log(m: &M) -> V {
+    let angle = ((m[0][0] + m[1][1] + m[2][2] - 1.0) / 2.0).clamp(-1.0, 1.0).acos();
+    let axis = [m[2][1] - m[1][2], m[0][2] - m[2][0], m[1][0] - m[0][1]];
+    if angle < 1e-9 {
+        return scale(axis, 0.5);
+    }
+    scale(axis, angle / (2.0 * angle.sin()).max(1e-9))
+}
+
 /// The head in the room. The head frame is the arms': x right, y up, z back toward the wearer. The room's frame is
 /// the head's at the start, turned so y is straight up.
-struct Tracker {
+pub(crate) struct Tracker {
     /// From the head frame to the room's.
-    turn: M,
+    pub(crate) turn: M,
     /// Where the head is and how fast it moves, in the room, m and m/s.
     position: V,
     speed: V,
-    /// The last rate of turn, rad/s, head frame.
+    /// The rate of turn, rad/s, head frame, smoothed over the last few readings.
     rate: V,
     /// What the accelerometers read at rest, mg.
     gravity: f64,
@@ -126,7 +139,7 @@ struct Tracker {
 
 impl Tracker {
     /// A tracker for a head at rest whose accelerometers read `at_rest` (mg, head frame).
-    fn new(at_rest: V, translate: bool) -> Tracker {
+    pub(crate) fn new(at_rest: V, translate: bool) -> Tracker {
         let gravity = norm(at_rest);
         let up = scale(at_rest, 1.0 / gravity);
         // The smallest turn that takes the head's up to the room's.
@@ -137,8 +150,8 @@ impl Tracker {
     }
 
     /// Moves on `dt` seconds with the head turning at `rate` (rad/s) and the accelerometers reading `acc` (mg).
-    fn update(&mut self, rate: V, acc: V, dt: f64) {
-        self.rate = rate;
+    pub(crate) fn update(&mut self, rate: V, acc: V, dt: f64) {
+        self.rate = add(self.rate, scale(sub(rate, self.rate), RATE_SMOOTHING));
         self.turn = mul(&self.turn, &exp(scale(rate, dt)));
         // Gravity levels pitch and roll while nothing else accelerates the head.
         let size = norm(acc);
@@ -158,7 +171,7 @@ impl Tracker {
     }
 
     /// The head's turn and position `ahead` seconds from now, at the present rate and speed.
-    fn predicted(&self, ahead: f64) -> (M, V) {
+    pub(crate) fn predicted(&self, ahead: f64) -> (M, V) {
         (mul(&self.turn, &exp(scale(self.rate, ahead))), add(self.position, scale(self.speed, ahead)))
     }
 }
@@ -282,10 +295,10 @@ fn render_code() -> Result<(Vec<u8>, Vec<u8>, u32), String> {
     Ok((code, pool, show))
 }
 
-/// Host code that shows `text` in the middle of a cleared panel, in the 24-pixel font.
-fn message(text: &str) -> Vec<Vec<u8>> {
+/// Host code that shows `text` in the middle of a cleared panel, in the font at `scale`.
+fn message(text: &str, scale: u8) -> Vec<Vec<u8>> {
     let glyphs = v5::text_indices(text);
-    let x = 320 - 12 * glyphs.len() as i32;
+    let x = 320 - 4 * scale as i32 * glyphs.len() as i32;
     vec![
         v5::fill(0, 0, v5::WIDTH, v5::HEIGHT, 0),
         v5::write(v5::TEXT, &glyphs),
@@ -305,186 +318,32 @@ fn reading(values: &[u32]) -> Option<(V, V)> {
     Some(([v[0], v[1], v[2]].map(|mdps| (mdps / 1000.0).to_radians()), [v[3], v[4], v[5]]))
 }
 
-pub async fn pinned(side: Option<Side>, boost: u8, translate: bool) -> Result<(), Error> {
-    let (code, pool, show) = render_code()?;
-    let mut arms = crate::v0::arms(side).await?;
-    let mut lead = Duration::ZERO;
-    let mask: u16 = 1 << trigger::TOUCH;
-    for arm in &mut arms {
-        arm.control(v5::ctrl::VM_STOP, &[]).await?;
-        crate::v0::upload_font(arm, 3).await?;
-        let max = arm.max_code;
-        let mut writes = v5::upload(POOL, &pool, max);
-        writes.extend(v5::upload(CODE, &code, max));
-        writes.push(v5::write(LAST, &[0; 96]));
-        writes.push(v5::set(prop::IMU_RATE, 104));
-        writes.push(v5::set(prop::GYRO_RATE, 104));
-        writes.extend(message("hold still"));
-        arm.run(writes).await?;
-        arm.flush().await?;
-        crate::v0_sensors::start_idle_program(arm, IDLE).await?;
-        arm.control(v5::ctrl::EVENTS, &mask.to_le_bytes()).await?;
-        for _ in 0..2 {
-            match arm.ask_for_fast_link().await {
-                Ok(interval) if interval <= Duration::from_millis(15) => break,
-                Ok(_) => {}
-                Err(e) => link::trace(format_args!("{e}")),
-            }
-        }
-        let round_trip = arm.sync_clock().await?;
-        lead = lead.max(2 * arm.interval() + round_trip / 2 + Duration::from_millis(15));
-    }
-
-    // What each gyroscope reads at rest, and which way gravity pulls.
-    println!("hold still…");
-    let mut rest: Vec<(V, usize)> = vec![([0.0; 3], 0); arms.len()];
-    let mut gravity = ([0.0; 3], 0);
-    let started = Instant::now();
-    while started.elapsed() < CALIBRATE {
-        for (arm, rest) in arms.iter_mut().zip(&mut rest) {
-            if let Some((rate, acc)) = reading(&arm.props(&READINGS).await?) {
-                *rest = (add(rest.0, rate), rest.1 + 1);
-                gravity = (add(gravity.0, acc), gravity.1 + 1);
-            }
+/// Readies `arm` for a head-following program: the font at `scale`, `writes` (its routines), the motion sensors at
+/// full rate, "hold still" on the panel, the do-nothing program for the light sensor, TouchBar taps reported, the
+/// fast link and the clocks lined up. Returns how far ahead frames must be sent.
+pub(crate) async fn start(arm: &mut Arm, scale: u8, mut writes: Vec<Vec<u8>>) -> Result<Duration, Error> {
+    arm.control(v5::ctrl::VM_STOP, &[]).await?;
+    crate::v0::upload_font(arm, scale).await?;
+    writes.push(v5::set(prop::IMU_RATE, 104));
+    writes.push(v5::set(prop::GYRO_RATE, 104));
+    writes.extend(message("hold still", scale));
+    arm.run(writes).await?;
+    arm.flush().await?;
+    crate::v0_sensors::start_idle_program(arm, IDLE).await?;
+    arm.control(v5::ctrl::EVENTS, &(1u16 << trigger::TOUCH).to_le_bytes()).await?;
+    for _ in 0..2 {
+        match arm.ask_for_fast_link().await {
+            Ok(interval) if interval <= Duration::from_millis(15) => break,
+            Ok(_) => {}
+            Err(e) => link::trace(format_args!("{e}")),
         }
     }
-    if gravity.1 == 0 {
-        return Err("no readings from the gyroscopes".into());
-    }
-    let bias: Vec<V> = rest.iter().map(|(sum, n)| scale(*sum, 1.0 / (*n).max(1) as f64)).collect();
-    let mut tracker = Tracker::new(scale(gravity.0, 1.0 / gravity.1 as f64), translate);
-    let mut cube = Cube::ahead(&tracker.turn, tracker.position);
-    for arm in &mut arms {
-        arm.run([v5::fill(0, 0, v5::WIDTH, v5::HEIGHT, 0), v5::draw(0, 0, v5::WIDTH, v5::HEIGHT)]).await?;
-    }
-    println!("pinned 1 m ahead; tap a TouchBar to bring it back in front. Ctrl-C to stop");
+    let round_trip = arm.sync_clock().await?;
+    Ok(2 * arm.interval() + round_trip / 2 + Duration::from_millis(15))
+}
 
-    let mut light = v5::UNKNOWN;
-    let mut brightness: Option<u32> = None;
-    let mut reads: Vec<Option<(u8, Vec<u8>, Instant)>> = arms.iter().map(|_| None).collect();
-    let mut rects: Vec<Option<[i32; 4]>> = vec![None; arms.len()];
-    let mut queued: Vec<std::collections::VecDeque<u16>> = vec![Default::default(); arms.len()];
-    let mut next_due: Option<u32> = None;
-    let mut updated = Instant::now();
-    let (mut frames, mut readings) = (0u64, 0u64);
-    let mut reported = Instant::now();
-    let stop = tokio::signal::ctrl_c();
-    tokio::pin!(stop);
-    loop {
-        frames += 1;
-        let frame = async {
-            // Readings in, the next asked for; a tap brings the cube back ahead.
-            let mut fresh: Vec<(V, V)> = Vec::new();
-            for (i, (arm, read)) in arms.iter_mut().zip(&mut reads).enumerate() {
-                arm.poll().await?;
-                if let Some((tag, ids, _)) = read
-                    && let Some(reply) = arm.reply(*tag)
-                {
-                    let values: Vec<u32> = reply?.as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b)).collect();
-                    if let Some((rate, acc)) = reading(&values) {
-                        fresh.push((sub(rate, bias[i]), acc));
-                    }
-                    if let Some(&value) = ids.iter().position(|&id| id == prop::LIGHT).and_then(|at| values.get(at)) {
-                        light = value;
-                    }
-                    *read = None;
-                }
-                while let Some(event) = arm.events.pop_front() {
-                    if let v5::EventKind::Input { trigger: trigger::TOUCH, value: 1 } = event.kind {
-                        tracker.position = [0.0; 3];
-                        tracker.speed = [0.0; 3];
-                        cube = Cube::ahead(&tracker.turn, tracker.position);
-                    }
-                }
-                if read.as_ref().is_none_or(|r| r.2.elapsed() > Duration::from_millis(300)) {
-                    let mut ids = READINGS.to_vec();
-                    if arm.side == Side::Right && frames.is_multiple_of(20) {
-                        ids.push(prop::LIGHT);
-                    }
-                    let tag = arm.request(v5::ctrl::PROPS, &ids).await?;
-                    *read = Some((tag, ids, Instant::now()));
-                }
-            }
-            if !fresh.is_empty() {
-                let n = fresh.len() as f64;
-                let rate = scale(fresh.iter().fold([0.0; 3], |s, f| add(s, f.0)), 1.0 / n);
-                let acc = scale(fresh.iter().fold([0.0; 3], |s, f| add(s, f.1)), 1.0 / n);
-                let dt = updated.elapsed().as_secs_f64().min(0.2);
-                updated = Instant::now();
-                tracker.update(rate, acc, dt);
-                readings += 1;
-            }
-
-            // The moment this frame is shown, on the beat.
-            let waits = arms.iter_mut().zip(&mut queued).map(|(arm, queued)| async move {
-                while queued.len() >= QUEUE {
-                    arm.wait_for(queued.pop_front().unwrap()).await?;
-                }
-                Ok::<(), Error>(())
-            });
-            futures::future::try_join_all(waits).await?;
-            let interval = arms.iter().map(|a| a.interval()).max().unwrap_or_default();
-            let lead = (lead + interval).as_micros() as u32;
-            let earliest = v5_link::host_us().wrapping_add(lead);
-            let due = match next_due {
-                Some(due) if (due.wrapping_sub(earliest) as i32) > 0 => due,
-                _ => earliest,
-            };
-            let send_at = due.wrapping_sub(lead).wrapping_sub(v5_link::host_us()) as i32;
-            if send_at > 0 {
-                tokio::time::sleep(Duration::from_micros(send_at as u64)).await;
-            }
-            next_due = Some(due.wrapping_add(PERIOD.as_micros() as u32));
-
-            // Each eye's view from where the head will be then.
-            let ahead = (due.wrapping_sub(v5_link::host_us()) as i32).max(0) as f64 / 1e6
-                + READING_AGE
-                + updated.elapsed().as_secs_f64();
-            let (turn, position) = tracker.predicted(ahead);
-            let mut extra = Vec::new();
-            if light != v5::UNKNOWN {
-                let want = crate::v0_sensors::brightness_for(light, boost);
-                if brightness.is_none_or(|b| b.abs_diff(want) >= 2) {
-                    extra.push(v5::set(prop::BRIGHTNESS, want));
-                    brightness = Some(want);
-                }
-            }
-            let sends = arms.iter_mut().zip(&mut queued).zip(&mut rects).map(|((arm, queued), rect)| {
-                let edges = view(&cube, &turn, position, v0_cube::eye(Some(arm.side)));
-                let (state, now) = state(&edges, *rect);
-                *rect = now;
-                let mut code = vec![v5::write(STATE, &state), v5::call(CODE)];
-                code.extend(extra.iter().cloned());
-                code.push(v5::sleep_until(arm.arm_time(due)));
-                code.push(v5::call(show));
-                async move {
-                    arm.run(code).await?;
-                    queued.push_back(arm.sent());
-                    Ok::<(), Error>(())
-                }
-            });
-            futures::future::try_join_all(sends).await?;
-            Ok::<(), Error>(())
-        };
-        tokio::select! {
-            _ = &mut stop => break,
-            done = frame => done?,
-        }
-        if reported.elapsed() > Duration::from_secs(5) {
-            let secs = reported.elapsed().as_secs_f64();
-            let ahead = apply(&tracker.turn, [0.0, 0.0, -1.0]);
-            println!(
-                "{:.1} frames/s, {:.1} readings/s, heading {:.0}°, pitch {:.0}°, head {:.0} cm from the start",
-                frames as f64 / secs,
-                readings as f64 / secs,
-                (-ahead[0]).atan2(-ahead[2]).to_degrees(),
-                ahead[1].asin().to_degrees(),
-                norm(tracker.position) * 100.0
-            );
-            (frames, readings) = (0, 0);
-            reported = Instant::now();
-        }
-    }
+/// Stops the program on each arm, puts the sensors back as they were at boot and switches the panel off.
+pub(crate) async fn finish(mut arms: Vec<Arm>) -> Result<(), Error> {
     for arm in &mut arms {
         arm.control(v5::ctrl::VM_STOP, &[]).await?;
         arm.run([v5::set(prop::IMU_RATE, 13), v5::set(prop::GYRO_RATE, 0), v5::set(prop::PANEL, 0)]).await?;
@@ -494,6 +353,248 @@ pub async fn pinned(side: Option<Side>, boost: u8, translate: bool) -> Result<()
         arm.disconnect().await;
     }
     Ok(())
+}
+
+/// The head, from the arms' readings: each frame takes in what arrived and asks each arm for the next.
+pub(crate) struct Head {
+    pub(crate) tracker: Tracker,
+    /// What each arm's gyroscope reads at rest.
+    bias: Vec<V>,
+    reads: Vec<Option<(u8, Vec<u8>, Instant)>>,
+    updated: Instant,
+    asked: u64,
+    /// The right arm's light, 0.01 lux, as last read.
+    pub(crate) light: u32,
+    /// Readings taken in, for the rate shown.
+    pub(crate) readings: u64,
+}
+
+impl Head {
+    /// Holds still for CALIBRATE: what each gyroscope reads at rest, and which way gravity pulls.
+    pub(crate) async fn calibrate(arms: &mut [Arm], translate: bool) -> Result<Head, Error> {
+        println!("hold still…");
+        let mut rest: Vec<(V, usize)> = vec![([0.0; 3], 0); arms.len()];
+        let mut gravity = ([0.0; 3], 0);
+        let started = Instant::now();
+        while started.elapsed() < CALIBRATE {
+            for (arm, rest) in arms.iter_mut().zip(&mut rest) {
+                if let Some((rate, acc)) = reading(&arm.props(&READINGS).await?) {
+                    *rest = (add(rest.0, rate), rest.1 + 1);
+                    gravity = (add(gravity.0, acc), gravity.1 + 1);
+                }
+            }
+        }
+        if gravity.1 == 0 {
+            return Err("no readings from the gyroscopes".into());
+        }
+        for arm in arms.iter_mut() {
+            arm.run([v5::fill(0, 0, v5::WIDTH, v5::HEIGHT, 0), v5::draw(0, 0, v5::WIDTH, v5::HEIGHT)]).await?;
+        }
+        Ok(Head {
+            tracker: Tracker::new(scale(gravity.0, 1.0 / gravity.1 as f64), translate),
+            bias: rest.iter().map(|(sum, n)| scale(*sum, 1.0 / (*n).max(1) as f64)).collect(),
+            reads: arms.iter().map(|_| None).collect(),
+            updated: Instant::now(),
+            asked: 0,
+            light: v5::UNKNOWN,
+            readings: 0,
+        })
+    }
+
+    /// Takes in the readings that arrived, moves the tracker on, and asks for the next (the right arm's light now
+    /// and then too). Returns whether a TouchBar was tapped.
+    pub(crate) async fn poll(&mut self, arms: &mut [Arm]) -> Result<bool, Error> {
+        self.asked += 1;
+        let (mut fresh, mut tapped): (Vec<(V, V)>, bool) = (Vec::new(), false);
+        for (i, (arm, read)) in arms.iter_mut().zip(&mut self.reads).enumerate() {
+            arm.poll().await?;
+            if let Some((tag, ids, _)) = read
+                && let Some(reply) = arm.reply(*tag)
+            {
+                let values: Vec<u32> = reply?.as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b)).collect();
+                if let Some((rate, acc)) = reading(&values) {
+                    fresh.push((sub(rate, self.bias[i]), acc));
+                }
+                if let Some(&value) = ids.iter().position(|&id| id == prop::LIGHT).and_then(|at| values.get(at)) {
+                    self.light = value;
+                }
+                *read = None;
+            }
+            while let Some(event) = arm.events.pop_front() {
+                tapped |= matches!(event.kind, v5::EventKind::Input { trigger: trigger::TOUCH, value: 1 });
+            }
+            if read.as_ref().is_none_or(|r| r.2.elapsed() > Duration::from_millis(300)) {
+                let mut ids = READINGS.to_vec();
+                if arm.side == Side::Right && self.asked.is_multiple_of(20) {
+                    ids.push(prop::LIGHT);
+                }
+                let tag = arm.request(v5::ctrl::PROPS, &ids).await?;
+                *read = Some((tag, ids, Instant::now()));
+            }
+        }
+        // Both arms' readings averaged, taken as holding since the last ones.
+        if !fresh.is_empty() {
+            let n = fresh.len() as f64;
+            let rate = scale(fresh.iter().fold([0.0; 3], |s, f| add(s, f.0)), 1.0 / n);
+            let acc = scale(fresh.iter().fold([0.0; 3], |s, f| add(s, f.1)), 1.0 / n);
+            let dt = self.updated.elapsed().as_secs_f64().min(0.2);
+            self.updated = Instant::now();
+            self.tracker.update(rate, acc, dt);
+            self.readings += 1;
+        }
+        Ok(tapped)
+    }
+
+    /// The head's turn and position when a frame due at `due` (the Mac's clock) appears, as the latest readings
+    /// say.
+    pub(crate) fn at(&self, due: u32) -> (M, V) {
+        let ahead = (due.wrapping_sub(v5_link::host_us()) as i32).max(0) as f64 / 1e6
+            + READING_AGE
+            + self.updated.elapsed().as_secs_f64();
+        self.tracker.predicted(ahead)
+    }
+}
+
+/// One arm's frame: the host code that draws it, and the host code that puts it on the panel at its moment.
+pub(crate) type Frame = (Vec<Vec<u8>>, Vec<Vec<u8>>);
+
+/// Frames on a steady beat, PERIOD apart, each sent far enough ahead to reach both arms, and no more than QUEUE
+/// waiting on an arm.
+pub(crate) struct Beat {
+    lead: Duration,
+    next_due: Option<u32>,
+    queued: Vec<std::collections::VecDeque<u16>>,
+    brightness: Option<u32>,
+}
+
+impl Beat {
+    pub(crate) fn new(lead: Duration, arms: &[Arm]) -> Beat {
+        Beat { lead, next_due: None, queued: vec![Default::default(); arms.len()], brightness: None }
+    }
+
+    /// Waits until the arms have room and it's time to send the next frame. Returns the moment it's to appear, in
+    /// the Mac's clock.
+    pub(crate) async fn next(&mut self, arms: &mut [Arm]) -> Result<u32, Error> {
+        let waits = arms.iter_mut().zip(&mut self.queued).map(|(arm, queued)| async move {
+            while queued.len() >= QUEUE {
+                arm.wait_for(queued.pop_front().unwrap()).await?;
+            }
+            Ok::<(), Error>(())
+        });
+        futures::future::try_join_all(waits).await?;
+        let interval = arms.iter().map(|a| a.interval()).max().unwrap_or_default();
+        let lead = (self.lead + interval).as_micros() as u32;
+        let earliest = v5_link::host_us().wrapping_add(lead);
+        let due = match self.next_due {
+            Some(due) if (due.wrapping_sub(earliest) as i32) > 0 => due,
+            _ => earliest,
+        };
+        let send_at = due.wrapping_sub(lead).wrapping_sub(v5_link::host_us()) as i32;
+        if send_at > 0 {
+            tokio::time::sleep(Duration::from_micros(send_at as u64)).await;
+        }
+        self.next_due = Some(due.wrapping_add(PERIOD.as_micros() as u32));
+        Ok(due)
+    }
+
+    /// Sends each arm its frame: `render` (drawing it), a brightness change for `light` if one is due, then at
+    /// `due` `show` (putting it on the panel).
+    pub(crate) async fn send(
+        &mut self,
+        arms: &mut [Arm],
+        due: u32,
+        light: u32,
+        boost: u8,
+        frames: Vec<Frame>,
+    ) -> Result<(), Error> {
+        let mut extra = None;
+        if light != v5::UNKNOWN {
+            let want = crate::v0_sensors::brightness_for(light, boost);
+            if self.brightness.is_none_or(|b| b.abs_diff(want) >= 2) {
+                extra = Some(v5::set(prop::BRIGHTNESS, want));
+                self.brightness = Some(want);
+            }
+        }
+        let sends = arms.iter_mut().zip(&mut self.queued).zip(frames).map(|((arm, queued), (render, show))| {
+            let mut code = render;
+            code.extend(extra.clone());
+            code.push(v5::sleep_until(arm.arm_time(due)));
+            code.extend(show);
+            async move {
+                arm.run(code).await?;
+                queued.push_back(arm.sent());
+                Ok::<(), Error>(())
+            }
+        });
+        futures::future::try_join_all(sends).await?;
+        Ok(())
+    }
+}
+
+pub async fn pinned(side: Option<Side>, boost: u8, translate: bool) -> Result<(), Error> {
+    let (code, pool, show) = render_code()?;
+    let mut arms = crate::v0::arms(side).await?;
+    let mut lead = Duration::ZERO;
+    for arm in &mut arms {
+        let max = arm.max_code;
+        let mut writes = v5::upload(POOL, &pool, max);
+        writes.extend(v5::upload(CODE, &code, max));
+        writes.push(v5::write(LAST, &[0; 96]));
+        lead = lead.max(start(arm, 3, writes).await?);
+    }
+    let mut head = Head::calibrate(&mut arms, translate).await?;
+    let mut cube = Cube::ahead(&head.tracker.turn, head.tracker.position);
+    println!("pinned 1 m ahead; tap a TouchBar to bring it back in front. Ctrl-C to stop");
+
+    let mut beat = Beat::new(lead, &arms);
+    let mut rects: Vec<Option<[i32; 4]>> = vec![None; arms.len()];
+    let mut frames = 0u64;
+    let mut reported = Instant::now();
+    let stop = tokio::signal::ctrl_c();
+    tokio::pin!(stop);
+    loop {
+        frames += 1;
+        let frame = async {
+            if head.poll(&mut arms).await? {
+                head.tracker.position = [0.0; 3];
+                head.tracker.speed = [0.0; 3];
+                cube = Cube::ahead(&head.tracker.turn, head.tracker.position);
+            }
+            let due = beat.next(&mut arms).await?;
+            // Each eye's view from where the head will be then.
+            let (turn, position) = head.at(due);
+            let frames = arms
+                .iter()
+                .zip(&mut rects)
+                .map(|(arm, rect)| {
+                    let edges = view(&cube, &turn, position, v0_cube::eye(Some(arm.side)));
+                    let (state, now) = state(&edges, *rect);
+                    *rect = now;
+                    (vec![v5::write(STATE, &state), v5::call(CODE)], vec![v5::call(show)])
+                })
+                .collect();
+            beat.send(&mut arms, due, head.light, boost, frames).await
+        };
+        tokio::select! {
+            _ = &mut stop => break,
+            done = frame => done?,
+        }
+        if reported.elapsed() > Duration::from_secs(5) {
+            let secs = reported.elapsed().as_secs_f64();
+            let ahead = apply(&head.tracker.turn, [0.0, 0.0, -1.0]);
+            println!(
+                "{:.1} frames/s, {:.1} readings/s, heading {:.0}°, pitch {:.0}°, head {:.0} cm from the start",
+                frames as f64 / secs,
+                head.readings as f64 / secs,
+                (-ahead[0]).atan2(-ahead[2]).to_degrees(),
+                ahead[1].asin().to_degrees(),
+                norm(head.tracker.position) * 100.0
+            );
+            (frames, head.readings) = (0, 0);
+            reported = Instant::now();
+        }
+    }
+    finish(arms).await
 }
 
 #[cfg(test)]
@@ -519,6 +620,13 @@ mod tests {
         let r = exp([0.0, std::f64::consts::FRAC_PI_2, 0.0]);
         assert!(close(apply(&r, [1.0, 0.0, 0.0]), [0.0, 0.0, -1.0]));
         assert!(close(apply(&mul(&r, &transpose(&r)), [0.3, 0.2, 0.1]), [0.3, 0.2, 0.1]));
+    }
+
+    #[test]
+    fn log_undoes_exp() {
+        for w in [[0.1, -0.2, 0.3], [0.0, 1.5, 0.0], [1e-12, 0.0, 0.0], [-2.0, 0.5, 1.0]] {
+            assert!(close(log(&exp(w)), w), "{w:?}");
+        }
     }
 
     #[test]

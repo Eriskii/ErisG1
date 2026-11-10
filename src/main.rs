@@ -15,6 +15,7 @@ mod v0;
 mod v0_cube;
 mod v0_cube_glasses;
 mod v0_flight;
+mod v0_follow;
 mod v0_pinned;
 mod v0_sensors;
 mod v5;
@@ -269,6 +270,21 @@ enum V0Command {
         #[arg(long, value_parser = ["left", "right"])]
         arm: Option<String>,
     },
+    /// A cross that follows your view lazily: turn your head and it stays put in the room, then glides back to the
+    /// middle. Text under it moves with it; text above is fixed to your view. Until Ctrl-C.
+    Follow {
+        /// Levels (of 42) added to the brightness Even's light table gives.
+        #[arg(long, default_value_t = 5)]
+        boost: u8,
+        /// How long the cross takes to come most of the way (1 − 1/e) back to the middle, seconds.
+        #[arg(long, default_value_t = 0.35)]
+        lag: f64,
+        /// The furthest the cross trails the middle, in pixels.
+        #[arg(long, default_value_t = 30.0)]
+        radius: f64,
+        #[arg(long, value_parser = ["left", "right"])]
+        arm: Option<String>,
+    },
     /// A frame around the whole 640 × 480 panel with ticks every 16 pixels, the coordinates every 64 and a cross in
     /// the middle, to see how much of it is visible. Stays until `v0 stop`.
     Extents {
@@ -399,6 +415,7 @@ async fn v0_command(command: V0Command) -> Result<(), Error> {
         V0Command::Cube { boost, from_mac: true, arm } => v0_cube::cube_hud(pick(arm), boost).await,
         V0Command::Cube { boost, from_mac: false, arm } => v0_cube_glasses::cube_on_glasses(pick(arm), boost).await,
         V0Command::Pinned { boost, rotation_only, arm } => v0_pinned::pinned(pick(arm), boost, !rotation_only).await,
+        V0Command::Follow { boost, lag, radius, arm } => v0_follow::follow_hud(pick(arm), boost, lag, radius).await,
         V0Command::Extents { arm } => v0::extents(pick(arm)).await,
         V0Command::Depth { arm } => v0::depth(pick(arm)).await,
         V0Command::Stop { arm } => v0_sensors::stop(pick(arm)).await,
