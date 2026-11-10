@@ -217,7 +217,7 @@ const HUD_MARGIN: i32 = 12;
 /// How often the HUD reads head pitch and roll. The accelerometer gives 13 readings a second unless asked for more.
 const HUD_POSE_EVERY: Duration = Duration::from_millis(150);
 /// Frames sent ahead of the one each arm is drawing, so the link never waits on a round trip.
-const HUD_QUEUE: usize = 2;
+const HUD_QUEUE: usize = 3;
 
 /// Instructions that clear the full-width band at `y` and draw `left` at its left end and `right` at its right, but
 /// don't show it yet.
@@ -243,8 +243,13 @@ pub async fn hud(side: Option<Side>, scale: u8) -> Result<(), Error> {
         upload_font(arm, scale).await?;
         arm.run([v5::fill(0, 0, v5::WIDTH, v5::HEIGHT, 0), v5::draw(0, 0, v5::WIDTH, v5::HEIGHT)]).await?;
         arm.flush().await?;
-        if let Err(e) = arm.ask_for_fast_link().await {
-            link::trace(format_args!("{e}"));
+        // macOS sometimes grants it only on the second request.
+        for _ in 0..2 {
+            match arm.ask_for_fast_link().await {
+                Ok(interval) if interval <= Duration::from_millis(15) => break,
+                Ok(_) => {}
+                Err(e) => link::trace(format_args!("{e}")),
+            }
         }
         let round_trip = arm.sync_clock().await?;
         // Time for a frame to reach the arm before it's due: two connection intervals, the clock's error (at most

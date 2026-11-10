@@ -257,15 +257,19 @@ impl Arm {
         if self.errors.is_empty() { Ok(()) } else { Err(std::mem::take(&mut self.errors).join("; ").into()) }
     }
 
-    /// Asks for the fastest link the Mac will give: a 7.5–15 ms connection interval and the 2M PHY. macOS decides.
-    pub async fn ask_for_fast_link(&mut self) -> Result<(), Error> {
+    /// Asks for a 7.5–15 ms connection interval and the 2M PHY; the Mac decides. Returns the interval in force
+    /// afterwards. (Asking for 15–30 ms, as Apple's accessory guidelines would have it, got 30 ms.)
+    pub async fn ask_for_fast_link(&mut self) -> Result<Duration, Error> {
         let mut body = Vec::new();
         for value in [6u16, 12, 0, 400] {
             body.extend(value.to_le_bytes());
         }
         body.push(2);
-        self.control(v5::ctrl::LINK, &body).await?;
-        Ok(())
+        let reply = self.control(v5::ctrl::LINK, &body).await?;
+        trace(format_args!("{}: link request answered {}", self.side.letter(), crate::proto::hex(&reply)));
+        // A granted change arrives as a NOTICE within a few connection events.
+        let _ = self.next_event(Duration::from_secs(2)).await?;
+        Ok(self.interval)
     }
 
     /// Measures the arm's clock against this program's (`host_us`) with a few `PING`s, keeping the one with the
@@ -276,7 +280,8 @@ impl Arm {
             let sent = host_us();
             let reply = self.control(v5::ctrl::PING, &sent.to_le_bytes()).await?;
             let received = host_us();
-            let [echo, t_rx, t_tx] = reply.as_chunks::<4>().0[..3].iter().map(|b| u32::from_le_bytes(*b)).collect::<Vec<_>>()[..]
+            let [echo, t_rx, t_tx] =
+                reply.as_chunks::<4>().0[..3].iter().map(|b| u32::from_le_bytes(*b)).collect::<Vec<_>>()[..]
             else {
                 return Err("short PING reply".into());
             };
@@ -395,6 +400,7 @@ impl Arm {
                     && let Some(units) = body.first_chunk::<2>()
                 {
                     self.interval = Duration::from_micros(u16::from_le_bytes(*units) as u64 * 1250);
+                    trace(format_args!("{}: link interval now {:?}", self.side.letter(), self.interval));
                 }
                 self.events.push_back(Event { kind, ..event });
             }

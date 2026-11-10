@@ -78,7 +78,7 @@ redrawn a region at a time, plus the accelerometer, gyroscope, TouchBar and ligh
 | `v0 hello` | Each arm's firmware, state, battery and sensors |
 | `v0 test` | A test pattern, then the panel read back to check every pixel arrived |
 | `v0 text TEXT [--scale N]` | Text in an 8×8 font drawn N times over |
-| `v0 hud [--scale N]` | Clock, both batteries, head pitch and roll and a frame counter, the same in both eyes. Each frame reaches both arms ahead of time with a moment to show it in each arm's own clock, so the eyes change together; about 15 frames a second |
+| `v0 hud [--scale N]` | Clock, both batteries, head pitch and roll and a frame counter, the same in both eyes. Each frame reaches both arms ahead of time with a moment to show it in each arm's own clock, so the eyes change together; about 20 frames a second on the 15 ms link it asks the Mac for |
 | `v0 imu [--hz N] [--gyro]` | Head pitch and roll, the accelerometer and the gyroscope |
 | `v0 events` | TouchBar gestures, wear, the case and the battery as they happen |
 | `v0 panel off\|on\|standby`, `v0 brightness [0-42] [--auto]`, `v0 reboot [--clear]` | |
