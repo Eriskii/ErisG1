@@ -71,6 +71,11 @@ pub(crate) struct Program {
 }
 
 impl Program {
+    /// Where its code ends in the arena.
+    pub fn code_end(&self) -> u32 {
+        CODE + self.code.len() as u32
+    }
+
     /// Host code that puts it in the arena, `start` being the arm's clock at the shared start moment.
     pub fn writes(&self, start: u32) -> Vec<Vec<u8>> {
         let mut w = v5::upload(POOL, &self.pool, 240);

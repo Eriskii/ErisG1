@@ -33,6 +33,7 @@ unsafe extern "C" {
     fn sim_next_event(s: *mut RawSim, out: *mut u8) -> u32;
     fn sim_panel(s: *const RawSim) -> *const u8;
     fn sim_panel_on(s: *const RawSim) -> c_int;
+    fn sim_arena(s: *mut RawSim) -> *mut u8;
 }
 
 /// What happens to the simulated glasses, by the second.
@@ -115,6 +116,11 @@ impl SimArm {
         let mut out = [0u8; 32];
         unsafe { sim_status(self.raw, out.as_mut_ptr()) };
         out
+    }
+
+    /// The arm's arena, as the program left it.
+    pub fn arena(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(sim_arena(self.raw), v5::ARENA as usize) }
     }
 
     pub fn panel(&self) -> Option<&[u8]> {
@@ -256,7 +262,12 @@ impl World {
                     arm.set(id, v.round() as i32 as u32);
                 }
             }
-            arm.set(prop::PITCH, pitch.round() as i32 as u32);
+            // A new pitch wakes the arm, as the accelerometer's sample does: TILT ranges are checked when it idles.
+            let pitch = pitch.round() as i32 as u32;
+            if arm.get(prop::PITCH) != pitch {
+                arm.wake = self.now;
+            }
+            arm.set(prop::PITCH, pitch);
             arm.set(prop::ROLL, roll.round() as i32 as u32);
             arm.set(prop::LIGHT, if right { (lux * 100.0) as u32 } else { v5::UNKNOWN });
             let pct = battery[right as usize];

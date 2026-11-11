@@ -223,6 +223,8 @@ pub mod prop {
     pub const BRIGHTNESS: u8 = 0x20;
     pub const PANEL: u8 = 0x21;
     pub const TIMER: u8 = 0x22;
+    pub const PITCH_LO: u8 = 0x24;
+    pub const PITCH_HI: u8 = 0x25;
     pub const IMU_RATE: u8 = 0x28;
     pub const BRIGHTNESS_CAP: u8 = 0x2A;
     pub const GYR_X: u8 = 0x30;
@@ -454,11 +456,17 @@ pub fn before(seq: u16, other: u16) -> bool {
 // font the stock-firmware images use, drawn `scale` times over.
 
 /// The characters of the font, in the protocol's glyph order (§4.1): `0`–`9`, `A`–`Z`, `a`–`z`, then the rest of
-/// printable ASCII by codepoint.
+/// printable ASCII by codepoint, then the degree sign.
 fn font_chars() -> Vec<char> {
     let mut chars: Vec<char> = ('0'..='9').chain('A'..='Z').chain('a'..='z').collect();
     chars.extend((' '..='~').filter(|c| !c.is_ascii_alphanumeric()));
+    chars.push('°');
     chars
+}
+
+/// The characters of the shell's fonts, in glyph order.
+pub fn text_chars() -> Vec<char> {
+    font_chars()
 }
 
 /// The glyph `c` draws as: itself, or `?`.
@@ -475,7 +483,7 @@ pub fn text_indices(text: &str) -> Vec<u8> {
 
 /// The font blob (§4.2): the 8 × 8 font at `scale`, every glyph `8·scale` square and that wide apart.
 pub fn font(scale: u8) -> Vec<u8> {
-    use font8x8::{BASIC_FONTS, UnicodeFonts};
+    use font8x8::{BASIC_FONTS, LATIN_FONTS, UnicodeFonts};
     let chars = font_chars();
     let size = 8 * scale as usize;
     let n = chars.len();
@@ -502,7 +510,7 @@ pub fn font(scale: u8) -> Vec<u8> {
         blob.extend((c as u32).to_le_bytes());
     }
     for &c in &chars {
-        let glyph = BASIC_FONTS.get(c).unwrap_or([0; 8]);
+        let glyph = BASIC_FONTS.get(c).or_else(|| LATIN_FONTS.get(c)).unwrap_or([0; 8]);
         // `size` rows of `size` bits, most significant first. In font8x8, bit 0 is the leftmost pixel.
         let mut bits = vec![0u8; glyph_bytes];
         for y in 0..size {
@@ -600,7 +608,8 @@ mod tests {
         let n = u16::from_le_bytes([blob[8], blob[9]]) as usize;
         assert_eq!(&blob[..4], b"SKF\x01");
         assert_eq!(u32::from_le_bytes(blob[4..8].try_into().unwrap()) as usize, blob.len());
-        assert_eq!(n, 95);
+        // Printable ASCII and the degree sign.
+        assert_eq!(n, 96);
         assert_eq!(text_indices("0Aa :"), [0, 10, 36, 62, glyph_index(':')]);
         assert_eq!(glyph_index('é'), glyph_index('?'));
         // Every glyph's bitmap ends inside the blob.

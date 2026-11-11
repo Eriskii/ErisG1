@@ -26,9 +26,9 @@ mod run;
 mod sketch;
 mod steps;
 mod stopwatch;
-mod sysmon;
+pub(crate) mod sysmon;
 mod warp;
-mod weather;
+pub(crate) mod weather;
 
 use std::future::Future;
 use std::path::Path;

@@ -11,6 +11,7 @@ mod dfu;
 mod link;
 mod mcuboot;
 mod proto;
+mod shell;
 mod smp;
 mod v0;
 mod v0_cube;
@@ -151,6 +152,12 @@ enum Command {
     V0 {
         #[command(subcommand)]
         command: V0Command,
+    },
+    /// The shell: tiles that live on the glasses (a clock, the date, the battery, notifications, text), each a
+    /// rectangle with a priority. Without a subcommand, `run`.
+    Shell {
+        #[command(subcommand)]
+        command: Option<ShellCommand>,
     },
     /// Show what's in a firmware update (an update .zip or an image .bin) and whether the glasses would take it.
     Inspect { file: std::path::PathBuf },
@@ -365,6 +372,66 @@ enum V0Command {
     },
 }
 
+#[derive(Subcommand)]
+enum ShellCommand {
+    /// Put the shell on the glasses (or pick it up if it's running), keep their time, pass on notifications and text,
+    /// and serve the layout editor, until Ctrl-C. The shell goes on running on the glasses after.
+    Run {
+        /// The editor's port on 127.0.0.1.
+        #[arg(long, default_value_t = shell::PORT)]
+        port: u16,
+        /// Only the editor: don't connect to the glasses.
+        #[arg(long)]
+        no_glasses: bool,
+        #[arg(long, value_parser = ["left", "right"])]
+        arm: Option<String>,
+    },
+    /// Show a notification through a running `erisg1 shell`: "TITLE: text", or just text.
+    Say {
+        /// Its icon: app, message, mail, calendar, call, music, alert, bell (the default).
+        #[arg(long)]
+        icon: Option<String>,
+        #[arg(required = true)]
+        text: Vec<String>,
+    },
+    /// Put text in a tile (a text tile, by name) through a running `erisg1 shell`; no text turns it off.
+    Text { name: String, text: Vec<String> },
+    /// Turn a tile on through a running `erisg1 shell`, for SECONDS or until `hide`.
+    Show {
+        name: String,
+        #[arg(default_value_t = 0.0)]
+        seconds: f64,
+    },
+    /// Turn a tile off through a running `erisg1 shell`.
+    Hide { name: String },
+    /// Run the saved layout on two simulated arms and save what each eye shows as an animated PNG.
+    Preview {
+        #[arg(long, default_value = "previews")]
+        out: std::path::PathBuf,
+        /// The default layout rather than the saved one.
+        #[arg(long)]
+        default: bool,
+    },
+}
+
+async fn shell_command(command: Option<ShellCommand>) -> Result<(), Error> {
+    let run = ShellCommand::Run { port: shell::PORT, no_glasses: false, arm: None };
+    match command.unwrap_or(run) {
+        ShellCommand::Run { port, no_glasses, arm } => shell::run(arm.as_deref().map(side), port, no_glasses).await,
+        ShellCommand::Say { icon: None, text } => shell::tell(&format!("say {}", text.join(" "))).await,
+        ShellCommand::Say { icon: Some(icon), text } => {
+            if shell::icons::category_named(&icon).is_none() {
+                return Err(format!("no icon {icon:?}; there are {}", shell::icons::CATEGORY_NAMES).into());
+            }
+            shell::tell(&format!("notify {icon} {}", text.join(" "))).await
+        }
+        ShellCommand::Text { name, text } => shell::tell(&format!("text {name} {}", text.join(" "))).await,
+        ShellCommand::Show { name, seconds } => shell::tell(&format!("show {name} {seconds}")).await,
+        ShellCommand::Hide { name } => shell::tell(&format!("hide {name}")).await,
+        ShellCommand::Preview { out, default } => shell::preview(&out, default).await,
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let result = match Cli::parse().command {
@@ -396,6 +463,7 @@ async fn main() -> ExitCode {
         Command::Debug { command } => debug(&command).await,
         Command::Probe { listen, channel } => probe(Duration::from_secs(listen), channel).await,
         Command::V0 { command } => v0_command(command).await,
+        Command::Shell { command } => shell_command(command).await,
         Command::Inspect { file } => dfu::inspect(&file),
         Command::Images { arm, channel } => {
             let sides = match arm.as_deref() {

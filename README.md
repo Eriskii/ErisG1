@@ -129,6 +129,72 @@ the same moment, until Ctrl-C. One that runs on the glasses is a program built w
 with `Glasses::deploy`: the Mac leaves once it starts and `v0 stop` ends it. TouchBar gestures on either arm reach
 the other over the arm-to-arm link, and both act on them at the same moment, 200 ms later.
 
+### Shell
+
+The shell is what the glasses run day to day: one program per arm that lives there and shows **tiles**. A tile is a
+rectangle of the panel with a kind (its little program), a place in a priority list, the scenes it's in, and on or
+off. A tile that's on shows unless a tile above it that shows overlaps it; when it shows it has its whole rectangle,
+and every tile below that overlaps it, by even a pixel, hides until it goes. So a notification across the top hides
+the clock and battery under it while it's up, and they come back when it goes.
+
+| Kind | Shows |
+|---|---|
+| `clock` | the time with or without seconds, 12- or 24-hour, kept by the glasses |
+| `date` | the date in any strftime format, from a month of dates the Mac sends |
+| `battery` | both arms' charge, averaged (a battery and %) or each |
+| `notification` | an icon for its kind (message, mail, calendar, call, music, alert, app, bell), a title and wrapped text, or all on one line; a tap dismisses it, a double tap brings it back. New notifications on the Mac pop up in it (unless turned off) |
+| `notification_list` | what's in the Mac's Notification Center, newest first: an icon and a line each, as many as fit its height |
+| `weather` | an icon, the temperature and the humidity where the Mac is (open-meteo, every 10 minutes), each on or off |
+| `steps` | footprints and a step count: a placeholder until the phone sends one |
+| `heart_rate` | a heart and beats a minute: a placeholder until the phone or a watch sends them |
+| `navigation` | while a route is followed: the next turn (an arrow, the distance over the street) when the tile is at least twice as wide as high, else a square or round map around you, heading up, zoomed to show the turn. No source on the Mac yet (the phone's maps app later); the editor's "Demo route" walks a made-up one |
+| `device_battery` | the Mac's charge, and a bolt while it's on power |
+| `text` | lines from `erisg1 shell text NAME` |
+
+**Scenes**: tilting the head past a threshold (say 25° down, 20° up) switches to that scene's tiles, with 6° of give
+before switching back; a tile can be in several scenes (a notification is in all of them). The right arm watches
+the tilt (its accelerometer's `TILT` trigger) and both arms switch together.
+
+| | |
+|---|---|
+| `shell` | Puts the shell on the glasses (or picks it up if it's already running), keeps their time, passes on notifications, text, the weather, the Mac's battery and its notifications, and serves the layout editor at http://127.0.0.1:4141, until Ctrl-C. The shell goes on running on the glasses after: the clock, the battery, the scenes, taps, notifications timing out |
+| `shell say [--icon KIND] [TITLE:] TEXT` | A notification, through a running `erisg1 shell` |
+| `shell text NAME [TEXT]` | Text in a text tile; no text turns it off |
+| `shell show NAME [SECONDS]`, `shell hide NAME` | A tile on (for a while) or off |
+| `shell preview [--default]` | The saved (or default) layout on two simulated arms, as `previews/shell.png` |
+| `shell run --no-glasses` | Only the editor |
+
+On the glasses a tap on either TouchBar dismisses the top dismissable tile showing (a notification), a double tap
+brings it back, and a hold hides everything until the next hold. The panel is off with nothing showing and in the
+case.
+
+The editor drags and resizes tiles over a picture of what the glasses would show in each scene: the layout run on a
+simulated arm (`src/shell/sim.rs`) with sample data, the head tilted for the scene, redrawn as you change it. A
+dragged tile snaps to the edges and centres of the panel and of the scene's other tiles, to the gaps and margins
+they already keep, and (resizing) to their sizes, with guides showing what it lines up with; Shift places it freely.
+Strips of the display can be cut off (say the top and bottom 30 px): no tile may reach into them, and the layout's
+check refuses one that does. Each tile can have its own depth (else the layout's): the eyes see it that far apart. Clocks, dates and the
+tiles that show messages can use Departure Mono (11, 22 or 33 px), a pixel font that reads better small than the
+8 × 8 one; in messages it has 164 common emoji at 11 and 22 px (Noto Emoji, black and white), two characters wide.
+`tools/fonts.py` makes the data in `assets/fonts/` (see its NOTICE).
+Tiles that overlap in either eye count as overlapping, so tiles at different depths never draw over each other.
+The list's order is the priority; each kind has its own options. "Save & send to glasses" writes
+`~/.config/erisg1/shell.json` and puts the new layout on the glasses.
+
+How it works (`src/shell/program.rs`): the Mac builds each arm's program from the layout, with each tile's
+overlaps and each scene's tiles worked out ahead as masks, so when a tile turns on or off or the scene changes the
+arm finds what shows in a few instructions, clears the rectangles that changed, redraws the tiles that touch them
+and sends the area around them to the panel in one `DRAW`. Icons (`src/shell/icons.rs`) are shapes drawn here at
+each tile's size as 4-bit coverage, so their edges are smooth, and `BLIT`ted from the arena; the turn arrow is one
+slot the Mac redraws when the turn changes. A map (`src/shell/nav.rs`) is lines the Mac projects and clips to the
+tile, and the arm draws with `LINE`, skipping any point outside the tile. The Mac writes a tile's
+content, then a generation word, and raises a trigger; it never writes what the program writes, so the two can't
+race. Ticks fall on whole seconds the Mac sets in each arm's clock, and the right arm keeps the left's ticks (and
+scene) to its own over the arm-to-arm link once a minute, so the eyes stay together for as long as the shell runs
+alone. A later `erisg1 shell` reads a signature from the arena and picks up a shell it finds running instead of
+starting over. The Mac's notifications come from Notification Center's database
+(`~/Library/Group Containers/group.com.apple.usernoted/db2/db`, read-only).
+
 Both arms here run 0.5.60 with `firmware/patches/0001-ask-the-host-to-pair-in-the-case.patch`, built as 0.5.60+1.
 
 To build it, `firmware/scripts/setup.sh` puts NCS 2.5.1 (at the commits g1v0 was tested with), Zephyr SDK 0.16.5-1

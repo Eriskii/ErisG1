@@ -54,7 +54,7 @@ struct Vitals {
     top: Option<(String, f64)>,
 }
 
-fn output(program: &str, args: &[&str]) -> String {
+pub(crate) fn output(program: &str, args: &[&str]) -> String {
     Command::new(program)
         .args(args)
         .output()
@@ -106,7 +106,7 @@ fn parse_df(text: &str) -> Option<f64> {
 }
 
 /// The battery from `pmset -g batt`: its % and state ("charging", "discharging", "charged"...), `None` without one.
-fn parse_pmset(text: &str) -> Option<(u32, String)> {
+pub(crate) fn parse_pmset(text: &str) -> Option<(u32, String)> {
     let line = text.lines().find(|l| l.contains("InternalBattery"))?;
     let fields: Vec<&str> = line.split('\t').nth(1)?.split(';').map(str::trim).collect();
     let pct = fields.first()?.trim_end_matches('%').parse().ok()?;

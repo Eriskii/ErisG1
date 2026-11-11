@@ -284,7 +284,7 @@ fn locate() -> Option<(f64, f64, String)> {
 }
 
 /// Whether the Mac is set to Fahrenheit: its temperature setting, or failing that a US locale.
-fn mac_uses_fahrenheit() -> bool {
+pub(crate) fn mac_uses_fahrenheit() -> bool {
     let read = |key: &str| {
         Command::new("defaults")
             .args(["read", "-g", key])

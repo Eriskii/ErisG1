@@ -1,0 +1,12 @@
+The shell's font data (src/shell/fonts.rs reads it), made by tools/fonts.py:
+
+departure_mono.bin: Departure Mono 1.500 (firmware/scouter_kit/third_party/departure_mono, from
+https://github.com/rektdeckard/departure-mono), its printable ASCII and degree sign at 11 px as 1-bit cells.
+Copyright 2022-2024 Helena Zhang. SIL Open Font License 1.1 (LICENSE-departure-mono.txt). A modified version of the
+font under the same licence.
+
+emoji_1.bin, emoji_2.bin: 164 emoji from Noto Emoji, the black-and-white variable font NotoEmoji[wght].ttf of
+https://github.com/google/fonts (ofl/notoemoji, commit b979dba, SHA-256
+de6c18832938afc99caf132b39d6a30a19bac7f2e812e28db2535b4608d27551), weight 600, as 1-bit bitmaps at 12 and 24 px.
+Copyright 2013 Google LLC. SIL Open Font License 1.1 (LICENSE-noto-emoji.txt). A modified version of the font under
+the same licence.
