@@ -142,7 +142,7 @@ the clock and battery under it while it's up, and they come back when it goes.
 | `clock` | the time with or without seconds, 12- or 24-hour, kept by the glasses |
 | `date` | the date in any strftime format, from a month of dates the Mac sends |
 | `battery` | both arms' charge, averaged (a battery and %) or each |
-| `notification` | an icon for its kind (message, mail, calendar, call, music, alert, app, bell), a title and wrapped text, or all on one line; a tap dismisses it, a double tap brings it back. New notifications on the Mac pop up in it (unless turned off) |
+| `notification` | an icon for its kind (message, mail, calendar, call, music, alert, app, bell), a title (any size) and wrapped text, or only the icon before "title: text", or neither, or all on one line; it slides or fades in and out; several at once show one after the other, the first counting those waiting ("+2"); a tap dismisses it, a double tap brings it back. New notifications on the Mac pop up in it (unless turned off) |
 | `notification_list` | what's in the Mac's Notification Center, newest first: an icon and a line each, as many as fit its height |
 | `weather` | an icon, the temperature and the humidity where the Mac is (open-meteo, every 10 minutes), each on or off |
 | `steps` | footprints and a step count: a placeholder until the phone sends one |

@@ -15,7 +15,9 @@ pub(crate) mod layout;
 pub(crate) mod nav;
 pub(crate) mod program;
 pub(crate) mod sim;
+mod stats;
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -44,6 +46,17 @@ const TIME_EVERY: Duration = Duration::from_secs(600);
 const CONNECT_EVERY: Duration = Duration::from_secs(20);
 /// A notification sent while the glasses are away still shows if they come back within this.
 const KEEP_PENDING: Duration = Duration::from_secs(120);
+/// Notifications that wait while one shows, at most.
+const MAX_WAITING: usize = 50;
+
+/// A notification for a tile: its tile, "TITLE: text", its icon.
+#[derive(Clone)]
+struct Note {
+    tile: usize,
+    text: String,
+    icon: Option<u8>,
+}
+
 /// The demo route: so many metres closer to the turn every step.
 const DEMO_STEP: f64 = 20.0;
 const DEMO_EVERY: Duration = Duration::from_secs(2);
@@ -144,8 +157,13 @@ pub async fn run(side: Option<Side>, port: u16, offline: bool) -> Result<(), Err
     }
     println!("`erisg1 shell say TEXT` shows a notification. Ctrl-C leaves the shell running on the glasses");
 
+    if stats::enabled() {
+        stats::print_usage(&shell);
+    }
     let mut host = Host::new(shell, side, shared.clone());
-    let mut ticker = tokio::time::interval(Duration::from_millis(250));
+    // Measuring, the arms are asked about their load each tenth of a second.
+    let every = if stats::enabled() { 100 } else { 250 };
+    let mut ticker = tokio::time::interval(Duration::from_millis(every));
     let mut next_connect = Instant::now();
     let stop = tokio::signal::ctrl_c();
     tokio::pin!(stop);
@@ -227,6 +245,12 @@ struct Host {
     last_time: Instant,
     last_check: Instant,
     pending: Option<(String, Option<u8>, Instant)>,
+    /// The notification showing (its tile, text and icon), the last that did, and those waiting their turn.
+    showing: Option<Note>,
+    last_shown: Option<Note>,
+    waiting: VecDeque<Note>,
+    /// When the one showing was sent.
+    shown_at: Instant,
     /// The Mac's latest: the weather, its battery, Notification Center.
     weather: Option<feeds::Weather>,
     device: Option<(Option<u32>, bool)>,
@@ -235,6 +259,8 @@ struct Host {
     route: Option<nav::Route>,
     metric: bool,
     arrow: Option<nav::Turn>,
+    /// The arms' load, with `ERISG1_SHELL_STATS`.
+    load: Option<stats::Load>,
     shared: Arc<Mutex<Shared>>,
 }
 
@@ -249,12 +275,17 @@ impl Host {
             last_time: Instant::now(),
             last_check: Instant::now(),
             pending: None,
+            showing: None,
+            last_shown: None,
+            waiting: VecDeque::new(),
+            shown_at: Instant::now(),
             weather: None,
             device: None,
             inbox: Vec::new(),
             route: None,
             metric: feeds::metric(),
             arrow: None,
+            load: stats::enabled().then(stats::Load::new),
             shared,
         }
     }
@@ -349,6 +380,11 @@ impl Host {
         self.send_time().await?;
         self.feed_all().await?;
         self.publish();
+        // Away, the arms may have let the notification go unheard: the next waiting comes now.
+        self.showing = None;
+        if let Some(next) = self.waiting.pop_front() {
+            self.show_note(next).await?;
+        }
         if let Some((text, icon, at)) = self.pending.take()
             && at.elapsed() < KEEP_PENDING
         {
@@ -369,6 +405,7 @@ impl Host {
     /// Stops whatever the arms run and starts the shell on them, together.
     async fn install(&mut self, arms: &mut [Arm]) -> Result<(), Error> {
         self.arrow = None;
+        self.showing = None;
         for arm in arms.iter_mut() {
             self.note(format!("the {} arm: putting the shell on", side_name(arm.side)));
             arm.control(v5::ctrl::VM_STOP, &[]).await?;
@@ -481,9 +518,57 @@ impl Host {
             }
             return Ok(());
         }
-        let data = self.shell.note(i, text, icon.unwrap_or(icons::category(None)));
-        let seconds = self.shell.layout.tiles[i].timeout;
-        self.update(i, Some(&data), WANT_ON, seconds).await
+        let note = Note { tile: i, text: text.to_string(), icon };
+        // One shows: this one waits its turn, and the one showing counts it ("+2"). It's turned on again for the time
+        // it has left: if the arms haven't taken the first "on" yet, this takes its place (the arms read only a
+        // tile's latest words).
+        if let Some(showing) = self.showing.clone() {
+            if self.waiting.len() < MAX_WAITING {
+                self.waiting.push_back(note);
+            }
+            let data = self.note_data(&showing);
+            let timeout = self.shell.layout.tiles[showing.tile].timeout;
+            let left = if timeout > 0.0 { (timeout - self.shown_at.elapsed().as_secs_f64()).max(0.5) } else { 0.0 };
+            return self.update(showing.tile, Some(&data), WANT_ON, left).await;
+        }
+        self.show_note(note).await
+    }
+
+    /// A notification's content, with how many wait after it.
+    fn note_data(&self, note: &Note) -> TileData {
+        let icon = note.icon.unwrap_or(icons::category(None));
+        self.shell.note_waiting(note.tile, &note.text, icon, self.waiting.len())
+    }
+
+    /// A notification on, for its tile's time.
+    async fn show_note(&mut self, note: Note) -> Result<(), Error> {
+        let data = self.note_data(&note);
+        let seconds = self.shell.layout.tiles[note.tile].timeout;
+        self.update(note.tile, Some(&data), WANT_ON, seconds).await?;
+        self.last_shown = Some(note.clone());
+        self.showing = Some(note);
+        self.shown_at = Instant::now();
+        Ok(())
+    }
+
+    /// The glasses turned a tile off (its time was up, or a tap) or brought it back: a notification that went makes
+    /// way for the next waiting.
+    async fn note_event(&mut self, what: u32, tile: usize) -> Result<(), Error> {
+        match what {
+            program::NOTE_EXPIRED | program::NOTE_DISMISSED
+                if self.showing.as_ref().is_some_and(|n| n.tile == tile) =>
+            {
+                self.showing = None;
+                if let Some(next) = self.waiting.pop_front() {
+                    self.show_note(next).await?;
+                }
+            }
+            program::NOTE_RESTORED if self.last_shown.as_ref().is_some_and(|n| n.tile == tile) => {
+                self.showing = self.last_shown.clone();
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     async fn say(&mut self, text: &str, icon: Option<u8>) -> Result<(), Error> {
@@ -627,6 +712,7 @@ impl Host {
     /// Takes in what the arms sent; now and then checks they're there, and sends the time again.
     async fn poll(&mut self) {
         let mut lost = false;
+        let mut notes = Vec::new();
         for k in 0..self.arms.len() {
             let arm = &mut self.arms[k];
             if let Err(e) = arm.poll().await {
@@ -646,6 +732,7 @@ impl Host {
                             _ => "?",
                         };
                         println!("{name}: {what}");
+                        notes.push((a, b as usize));
                     }
                     v5::EventKind::Input { trigger: trigger::TOUCH, value } => {
                         println!("{} TouchBar: {}", side_name(arm.side), v5::gesture_name(value));
@@ -660,6 +747,12 @@ impl Host {
                     }
                     _ => {}
                 }
+            }
+        }
+        for (what, tile) in notes {
+            if !lost && let Err(e) = self.note_event(what, tile).await {
+                println!("{e}");
+                lost = true;
             }
         }
         if !lost && self.last_check.elapsed() >= CHECK_EVERY {
@@ -686,6 +779,13 @@ impl Host {
                 println!("{e}");
                 lost = true;
             }
+        }
+        if !lost
+            && let Some(load) = self.load.as_mut()
+            && let Err(e) = load.sample(&mut self.arms).await
+        {
+            println!("stats: {e}");
+            lost = true;
         }
         if lost {
             self.drop_lost().await;

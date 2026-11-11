@@ -35,6 +35,8 @@ pub(crate) const TILT_HYSTERESIS: i32 = 6;
 /// Navigation: the turn arrow's largest size, pixels (it sits with the fonts); the longest distance, "1.2 km".
 const MAX_TURN: i32 = 64;
 pub(crate) const DISTANCE_COLS: usize = 7;
+/// Notification: the room kept at the right of its first line for how many more wait, "+12".
+pub(crate) const BADGE_COLS: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -62,6 +64,31 @@ pub(crate) enum Kind {
     /// Directions while a route is followed: the next turn when the tile is wide (twice as wide as high or more),
     /// else a map around the position, heading up.
     Navigation,
+}
+
+/// How a tile comes and goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Transition {
+    /// At once.
+    None,
+    /// In from the top of its rectangle, out of the bottom.
+    Slide,
+    /// Brighter and brighter, and dimmer and dimmer.
+    Fade,
+}
+
+/// Notification: what's above its text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Header {
+    /// The icon and the title on a line of their own, a rule under them.
+    #[default]
+    Title,
+    /// No title line: the icon before the text, "title: text".
+    Icon,
+    /// Only "title: text".
+    None,
 }
 
 /// Navigation: the map's shape.
@@ -167,6 +194,11 @@ pub(crate) struct Tile {
     /// Notification: the Mac's own new notifications pop up in it.
     #[serde(default = "yes")]
     pub mirror: bool,
+    /// Notification: what's above its text, and the title's size (0: one size up from the text).
+    #[serde(default)]
+    pub header: Header,
+    #[serde(default)]
+    pub title_size: u8,
     /// Weather: the temperature, the humidity, the unit.
     #[serde(default = "yes")]
     pub temp: bool,
@@ -186,6 +218,12 @@ pub(crate) struct Tile {
     /// How far away it looks, metres (0 as far as can be), as the layout's `depth`; none, the layout's.
     #[serde(default)]
     pub depth: Option<f64>,
+    /// How it comes and goes; none, its kind's way (a notification slides).
+    #[serde(default)]
+    pub transition: Option<Transition>,
+    /// What older layouts said instead: it slides, or not.
+    #[serde(default, skip_serializing)]
+    pub slide: Option<bool>,
     /// Its font (its icons and battery bars are a character high); `size` counts in its sizes.
     #[serde(default)]
     pub font: Face,
@@ -268,6 +306,8 @@ impl Tile {
             both: false,
             single_line: false,
             mirror: true,
+            header: Header::Title,
+            title_size: 0,
             temp: true,
             humidity: true,
             unit: Unit::Auto,
@@ -275,9 +315,18 @@ impl Tile {
             shape: Shape::Square,
             text: String::new(),
             depth: None,
+            transition: None,
+            slide: None,
             font: Face::Pixel,
             preview: false,
         }
+    }
+
+    /// How it comes and goes.
+    pub fn transition(&self) -> Transition {
+        let older = self.slide.map(|s| if s { Transition::Slide } else { Transition::None });
+        let kind = if self.kind == Kind::Notification { Transition::Slide } else { Transition::None };
+        self.transition.or(older).unwrap_or(kind)
     }
 
     /// The font it draws in.
@@ -486,7 +535,8 @@ impl Tile {
             }
             Kind::Notification if self.single_line => {
                 let scale = if self.size > 0 { self.size } else { auto(3) };
-                let cols = cols(w - indent(scale), scale);
+                // The line less the counter's room.
+                let cols = cols(w - indent(scale), scale).saturating_sub(BADGE_COLS);
                 if cols < 4 || m(scale).height() > h {
                     return Err(format!("{name}: too small for a line at size {scale}"));
                 }
@@ -500,9 +550,25 @@ impl Tile {
                 } else {
                     1
                 };
-                let title = (body + 1).min(most);
+                // No title line: the text from the top, after the icon (its first line's) or not.
+                if self.header != Header::Title {
+                    let with_icon = self.header == Header::Icon && self.icon;
+                    let indent = if with_icon { m(body).height() + m(body).gap() } else { 0 };
+                    // (The first line less the counter's room.)
+                    let (cols, rows) = (cols(w - indent, body), rows(h, body));
+                    if cols < 4 + BADGE_COLS || rows == 0 {
+                        return Err(format!("{name}: too small for a line at size {body}"));
+                    }
+                    let icon = if with_icon { m(body).height() as u32 } else { 0 };
+                    return Ok(Plan { scale: body, cols, rows, icon, ..none });
+                }
+                if self.title_size > most {
+                    return Err(format!("{name}: title size {}: at most {most} in its font", self.title_size));
+                }
+                let title = if self.title_size > 0 { self.title_size } else { (body + 1).min(most) };
                 let body_top = m(title).height() + m(title).gap() + 3;
-                let (cols, title_cols) = (cols(w, body), cols(w - indent(title), title));
+                // The title less the icon's and the counter's room.
+                let (cols, title_cols) = (cols(w, body), cols(w - indent(title), title).saturating_sub(BADGE_COLS));
                 let rows = rows(h - body_top, body);
                 if cols == 0 || title_cols == 0 || rows == 0 {
                     return Err(format!(
@@ -562,7 +628,8 @@ impl Tile {
     /// The icon sets it draws, each at its size in pixels.
     fn icon_sets(&self, plan: &Plan) -> Vec<(IconSet, u32)> {
         match self.kind {
-            Kind::Notification | Kind::NotificationList if self.icon => vec![(IconSet::Category, plan.icon)],
+            Kind::Notification | Kind::NotificationList if plan.icon > 0 => vec![(IconSet::Category, plan.icon)],
+            Kind::Notification | Kind::NotificationList => Vec::new(),
             Kind::Navigation if plan.map => vec![(IconSet::Position, plan.icon)],
             Kind::Navigation => vec![(IconSet::Turn, plan.icon)],
             _ => self
@@ -888,6 +955,8 @@ impl Layout {
     pub fn settle(mut self) -> Layout {
         for t in &mut self.tiles {
             t.scenes = Some(t.scenes());
+            t.transition = Some(t.transition());
+            t.slide = None;
         }
         self
     }
@@ -995,11 +1064,17 @@ pub(crate) fn one_line(text: &str, cols: usize, emoji: bool) -> String {
 /// Words into at most `rows` lines of at most `cols` cells (an emoji takes two, with `emoji`; else it's `?`): a word
 /// too long for a line is broken, and "..." ends the last line when text is left out.
 pub(crate) fn wrap(text: &str, cols: usize, rows: usize, emoji: bool) -> Vec<String> {
+    wrap_first(text, cols, cols, rows, emoji)
+}
+
+/// The same, the first line `first` cells at most.
+pub(crate) fn wrap_first(text: &str, first: usize, cols: usize, rows: usize, emoji: bool) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     let mut line: Vec<char> = Vec::new();
     for word in clean(text, emoji).split_whitespace() {
         let mut word: Vec<char> = word.chars().collect();
         while !word.is_empty() {
+            let cols = if lines.is_empty() { first } else { cols };
             let need = if line.is_empty() { cells(&word) } else { cells(&line) + 1 + cells(&word) };
             if need <= cols {
                 if !line.is_empty() {
@@ -1021,9 +1096,10 @@ pub(crate) fn wrap(text: &str, cols: usize, rows: usize, emoji: bool) -> Vec<Str
     }
     if lines.len() > rows {
         lines.truncate(rows);
+        let room = if rows == 1 { first } else { cols };
         if let Some(last) = lines.last_mut() {
             let chars: Vec<char> = last.chars().collect();
-            *last = chars[..fitting(&chars, cols.saturating_sub(3))].iter().collect::<String>() + "...";
+            *last = chars[..fitting(&chars, room.saturating_sub(3))].iter().collect::<String>() + "...";
         }
     }
     lines
@@ -1061,9 +1137,12 @@ mod tests {
     fn an_old_layout_loads_with_its_kinds_scenes() {
         let json = r#"{"depth":0.0,"boost":5,"tiles":[
             {"name":"n","kind":"notification","rect":[16,160,608,200]},
-            {"name":"c","kind":"clock","rect":[16,136,188,20],"on":true,"size":2}]}"#;
+            {"name":"c","kind":"clock","rect":[16,136,188,20],"on":true,"size":2,"slide":true}]}"#;
         let layout = serde_json::from_str::<Layout>(json).unwrap().settle();
         assert_eq!(layout.tiles[0].scenes.as_deref(), Some(&SCENES[..]));
+        // "slide" as layouts said it before: a notification slides by its kind, the clock as told.
+        assert_eq!(layout.tiles.iter().map(|t| t.transition).collect::<Vec<_>>(), [Some(Transition::Slide); 2]);
+        assert!(!serde_json::to_string(&layout).unwrap().contains("\"slide\":"));
         assert_eq!(layout.tiles[1].scenes.as_deref(), Some(&[Scene::Level][..]));
         assert!(layout.tiles[0].icon && layout.tilt_down.is_none());
         layout.check().unwrap();
@@ -1108,16 +1187,16 @@ mod tests {
         assert!(small.plan().is_err());
         let note = Tile::new("n", Kind::Notification, [0, 0, 600, 200]);
         let plan = note.plan().unwrap();
-        // The title less its 24 px icon and a gap.
-        assert_eq!((plan.title_scale, plan.scale, plan.title_cols, plan.cols, plan.icon), (3, 2, 23, 36, 24));
+        // The title less its 24 px icon and a gap, and 4 characters for the counter.
+        assert_eq!((plan.title_scale, plan.scale, plan.title_cols, plan.cols, plan.icon), (3, 2, 19, 36, 24));
         // A 33 px title band, then 20 px lines in the 188 px left.
         assert_eq!(plan.rows, 7);
         let mut one = note.clone();
         one.single_line = true;
-        // Framed: 588 × 28 inside, 24 px text after a 24 px icon and a gap.
+        // Framed: 588 × 28 inside, 24 px text after a 24 px icon and a gap, less the counter.
         one.rect = [0, 0, 600, 40];
         let plan = one.plan().unwrap();
-        assert_eq!((plan.scale, plan.rows, plan.icon, plan.cols), (3, 1, 24, 23));
+        assert_eq!((plan.scale, plan.rows, plan.icon, plan.cols), (3, 1, 24, 19));
         let date = Tile::new("d", Kind::Date, [0, 0, 300, 30]);
         assert_eq!(date.plan().unwrap().cols, 10);
         // The weather: icon, " 12°", a drop and " 65%": 8 + 4 + 32 + 8 + 8 + 1 + 32 = 93 units.
@@ -1192,6 +1271,26 @@ mod tests {
         assert_eq!(wrap("lunch? 👍️🍜 ok", 9, 2, true), ["lunch?", "👍🍜 ok"]);
         assert_eq!(wrap("lunch? 👍️🍜 ok", 9, 2, false), ["lunch? ??", "ok"]);
         assert_eq!(one_line("🎉🎉🎉🎉 party", 7, true), "🎉🎉...");
+    }
+
+    #[test]
+    fn a_notification_header_can_be_smaller_an_icon_or_none() {
+        // 588 × 188 inside (framed), 16 px text.
+        let mut note = Tile::new("n", Kind::Notification, [0, 0, 600, 200]);
+        note.title_size = 2;
+        let plan = note.plan().unwrap();
+        // A 16 px title: a band of 16 + 4 + 3 px, then (188 - 23 + 4) / 20 lines.
+        assert_eq!((plan.title_scale, plan.icon, plan.rows), (2, 16, 8));
+        note.header = Header::Icon;
+        let plan = note.plan().unwrap();
+        // No title line: 9 lines of 16 px characters, each after a 16 px icon and a gap (the first has it).
+        assert_eq!((plan.title_scale, plan.icon, plan.rows, plan.cols), (0, 16, 9, 35));
+        note.header = Header::None;
+        let plan = note.plan().unwrap();
+        assert_eq!((plan.icon, plan.rows, plan.cols), (0, 9, 36));
+        note.header = Header::Title;
+        note.title_size = 7;
+        assert!(note.plan().unwrap_err().contains("title size"));
     }
 
     #[test]

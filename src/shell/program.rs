@@ -23,7 +23,8 @@
 use super::fonts;
 use super::icons::{self, IconSet};
 use super::layout::{
-    Align, DATES, DISTANCE_COLS, Geometry, Kind, Layout, Part, Plan, TILT_HYSTERESIS, one_line, part_width,
+    Align, BADGE_COLS, DATES, DISTANCE_COLS, Geometry, Header, Kind, Layout, Part, Plan, TILT_HYSTERESIS, Transition,
+    one_line, part_width,
 };
 use super::nav::{self, MAX_ROADS, MAX_ROUTE};
 use crate::apps::kit::Options;
@@ -90,6 +91,25 @@ const ICON_MODE: u32 = 2;
 const ERASE_MODE: u32 = 3;
 /// A round map's edge.
 const RING_LEVEL: u8 = 7;
+/// A tile that slides takes this many frames this far apart to come in or go.
+const SLIDE_FRAMES: u32 = 6;
+const SLIDE_EVERY: u32 = 50_000;
+/// A tile that fades shows at these levels of 15 as it comes, and as it goes, this far apart (each frame draws it
+/// again, so they're further apart than a slide's).
+const FADE_IN: [u8; 3] = [4, 8, 12];
+const FADE_OUT: [u8; 3] = [11, 7, 3];
+const FADE_EVERY: u32 = 80_000;
+
+/// How far a sliding tile has come at each frame but the last, pixels of `h`: easing out as it comes, in as it goes.
+fn slide_steps(h: i32, going: bool) -> Vec<i32> {
+    (1..SLIDE_FRAMES)
+        .map(|j| {
+            let t = j as f64 / SLIDE_FRAMES as f64;
+            let eased = if going { t * t } else { 1.0 - (1.0 - t) * (1.0 - t) };
+            ((h as f64 * eased).round() as i32).clamp(1, h - 1)
+        })
+        .collect()
+}
 
 /// Where the Mac writes, the same in both arms' programs.
 #[derive(Clone, Debug, PartialEq)]
@@ -166,8 +186,14 @@ fn glyph(c: char) -> u32 {
 fn capacities(tile: &super::layout::Tile, plan: &Plan) -> Vec<usize> {
     match tile.kind {
         Kind::Text | Kind::NotificationList => vec![plan.cols; plan.rows],
-        Kind::Notification if tile.single_line => vec![plan.cols],
-        Kind::Notification => std::iter::once(plan.title_cols).chain(vec![plan.cols; plan.rows]).collect(),
+        // On one line, or without a title line: lines of text only.
+        // Then the counter of those waiting, "+3".
+        Kind::Notification if plan.title_scale == 0 => {
+            std::iter::repeat_n(plan.cols, plan.rows).chain([BADGE_COLS]).collect()
+        }
+        Kind::Notification => {
+            std::iter::once(plan.title_cols).chain(vec![plan.cols; plan.rows]).chain([BADGE_COLS]).collect()
+        }
         Kind::Date => vec![plan.cols; DATES],
         Kind::Weather => vec![4, 4],
         Kind::Steps => vec![6],
@@ -181,7 +207,8 @@ fn capacities(tile: &super::layout::Tile, plan: &Plan) -> Vec<usize> {
 
 /// Whether a tile's lines have icons.
 fn has_icons(tile: &super::layout::Tile) -> bool {
-    matches!(tile.kind, Kind::Notification | Kind::NotificationList | Kind::Weather) && tile.icon
+    let shown = tile.kind != Kind::Notification || tile.single_line || tile.header != Header::None;
+    matches!(tile.kind, Kind::Notification | Kind::NotificationList | Kind::Weather) && tile.icon && shown
 }
 
 /// The bytes of a map's points buffer.
@@ -243,6 +270,9 @@ struct Vars {
     msg_t: u16,
     /// The rectangle (x0, y0, x1, y1) drawn since the panel last changed.
     dirty: [u16; 4],
+    /// Tiles that slide and came since the panel last changed; the moment a slide out starts from (both arms').
+    entering: u16,
+    anim_at: u16,
 }
 
 struct TileVars {
@@ -348,6 +378,8 @@ pub(crate) fn build(layout: &Layout, geo: &Geometry, side: Side) -> Result<Built
         msg: p.var(0),
         msg_t: p.var(0),
         dirty: [p.var(v5::WIDTH), p.var(v5::HEIGHT), p.var(0), p.var(0)],
+        entering: p.var(0),
+        anim_at: p.var(0),
     };
     let mut t = Vec::new();
     for (i, tile) in layout.tiles.iter().enumerate() {
@@ -476,10 +508,16 @@ impl Gen<'_> {
 
     /// Tile `i`'s icon from `set`, `size` px, its top left at x, y. Uses R4.
     fn icon(&mut self, i: usize, set: IconSet, size: u32, pick: Pick, x: i32, y: i32) {
+        let cx = self.ki(x);
+        self.icon_at(i, set, size, pick, cx, y);
+    }
+
+    /// The same, its left edge at the word `cx`.
+    fn icon_at(&mut self, i: usize, set: IconSet, size: u32, pick: Pick, cx: u16, y: i32) {
         let base = self.geo.icons_at(set, size);
         let bytes = size * size / 2;
-        let [zero, stride, cx, cy, n, mode, level] =
-            [0, size / 2, x as u32, y as u32, size, ICON_MODE, self.layout.tiles[i].level as u32].map(|v| self.k(v));
+        let [zero, stride, cy, n, mode, level] =
+            [0, size / 2, y as u32, size, ICON_MODE, self.layout.tiles[i].level as u32].map(|v| self.k(v));
         let skip = self.p.fresh("no_icon");
         let src = match pick {
             Pick::First => self.k(base),
@@ -636,7 +674,7 @@ impl Gen<'_> {
         p.jump(JMP, "handle");
 
         // USER1: the Mac's update, at the moment it gave.
-        let (due, show) = (self.due, self.k(SHOW_HOST));
+        let (due, show, anim_at) = (self.due, self.k(SHOW_HOST), self.v.anim_at);
         let n = self.tiles();
         let p = &mut self.p;
         p.label("host");
@@ -644,6 +682,7 @@ impl Gen<'_> {
         p.op(SLEEP_UNTIL, &[moment]);
         p.jump(CALL, "catch_up");
         p.jump(CALL, "apply_host");
+        p.op(MOV, &[anim_at, moment]);
         p.jump(CALL, "arbitrate");
         let (updated, visible, drawn) = (self.v.updated, self.v.visible, self.v.drawn);
         for i in 0..n {
@@ -669,7 +708,7 @@ impl Gen<'_> {
     /// On the left: the right arm's tick, sent `phase` µs after it, moves this arm's ticks to the nearest whole
     /// second of the right's (by a quarter second at most); and its scene, if a change of scene didn't arrive.
     fn sync(&mut self) {
-        let (tick, scene, present_at) = (self.v.tick, self.v.scene, self.v.present_at);
+        let (tick, scene, present_at, anim_at) = (self.v.tick, self.v.scene, self.v.present_at, self.v.anim_at);
         let [mask, half, period, max, window, shift, three] =
             [PHASE_MASK, PERIOD / 2, PERIOD, MAX_CORRECTION, 2 * MAX_CORRECTION, SYNC_SCENE_SHIFT, 3]
                 .map(|x| self.k(x));
@@ -691,6 +730,7 @@ impl Gen<'_> {
         p.label("sync_scene");
         p.branch(BEQ, R6, scene, "sync_end");
         p.op(MOV, &[scene, R6]);
+        p.read(anim_at, prop::TIME_US);
         p.jump(CALL, "arbitrate");
         p.read(present_at, prop::TIME_US);
         p.jump(CALL, "present");
@@ -769,7 +809,8 @@ impl Gen<'_> {
     /// or a gesture. A tap turns off the top dismissable tile that shows; a double tap brings back the top one that's
     /// off and has had content; a hold hides everything, or shows it again.
     fn handle(&mut self) {
-        let (ev, moment, present_at, scene) = (self.v.ev, self.v.moment, self.v.present_at, self.v.scene);
+        let (ev, moment, present_at, scene, anim_at) =
+            (self.v.ev, self.v.moment, self.v.present_at, self.v.scene, self.v.anim_at);
         let (batt_l, batt_r, visible, active, timed, filled, quiet) =
             (self.v.batt_l, self.v.batt_r, self.v.visible, self.v.active, self.v.timed, self.v.filled, self.v.quiet);
         let [zero, one, two, three, four, k16, low, left, show] =
@@ -858,6 +899,7 @@ impl Gen<'_> {
         p.label("hold");
         p.op(XOR, &[quiet, quiet, one]);
         p.label("rearrange");
+        p.op(MOV, &[anim_at, moment]);
         p.jump(CALL, "arbitrate");
         p.label("handled");
         p.op(ADD, &[present_at, moment, show]);
@@ -920,6 +962,7 @@ impl Gen<'_> {
             p.op(NOTIFY, &[note, k_i]);
             p.label(next);
         }
+        self.p.op(MOV, &[self.v.anim_at, now_tick]);
         self.p.jump(CALL, "arbitrate");
 
         // Clocks when what they show changes, dates when the day does.
@@ -1017,8 +1060,40 @@ impl Gen<'_> {
         p.op(MOV, &[drawn, zero]);
         p.op(XOR, &[R1, R0, visible]);
         p.branch(BEQ, R1, zero, "arb_end");
+        // A tile that goes with a transition slides or fades out first, while the frame still has it (not when
+        // everything hides, or with the panel dark).
+        let sliding: Vec<usize> = (0..n).filter(|&i| self.layout.tiles[i].transition() != Transition::None).collect();
+        if !sliding.is_empty() {
+            let (lit, one) = (self.v.lit, self.k(1));
+            let p = &mut self.p;
+            p.op(OR, &[R2, in_case, quiet]);
+            p.branch(BNE, R2, zero, "arb_slid");
+            p.branch(BNE, lit, one, "arb_slid");
+            for &i in &sliding {
+                let (bit, next) = (self.bit(i), self.p.fresh("slide_out_next"));
+                let p = &mut self.p;
+                p.op(AND, &[R2, visible, bit]);
+                p.branch(BEQ, R2, zero, next);
+                p.op(AND, &[R2, R0, bit]);
+                p.branch(BNE, R2, zero, next);
+                if self.layout.tiles[i].transition() == Transition::Fade {
+                    self.fade_out(i);
+                } else {
+                    self.slide_out(i);
+                }
+                self.p.label(next);
+            }
+            self.p.label("arb_slid");
+        }
+        let mask = self.k(sliding.iter().fold(0, |m, &i| m | 1 << i));
+        let entering = self.v.entering;
+        let p = &mut self.p;
         p.op(MOV, &[visible, R0]);
         p.op(MOV, &[changed, R1]);
+        // Sliding tiles that come: `present` slides them in.
+        p.op(AND, &[R2, R1, R0]);
+        p.op(AND, &[R2, R2, mask]);
+        p.op(OR, &[entering, entering, R2]);
         for i in 0..n {
             let (bit, next) = (self.bit(i), self.p.fresh("clear_next"));
             let rect = on_panel(self.rect(i));
@@ -1076,6 +1151,27 @@ impl Gen<'_> {
         p.label("present_part");
         p.branch(BGES, dx0, dx1, "present_reset");
         p.branch(BGES, dy0, dy1, "present_reset");
+        // The first tile that came with a transition slides or fades in; then all that changed at once.
+        let entering = self.v.entering;
+        let sliding: Vec<usize> =
+            (0..self.tiles()).filter(|&i| self.layout.tiles[i].transition() != Transition::None).collect();
+        if !sliding.is_empty() {
+            self.p.branch(BEQ, entering, zero, "present_now");
+            for &i in &sliding {
+                let (bit, next) = (self.bit(i), self.p.fresh("slide_in_next"));
+                self.p.op(AND, &[R0, entering, bit]);
+                self.p.branch(BEQ, R0, zero, next);
+                if self.layout.tiles[i].transition() == Transition::Fade {
+                    self.fade_in(i);
+                } else {
+                    self.slide_in(i);
+                }
+                self.p.jump(JMP, "present_now");
+                self.p.label(next);
+            }
+            self.p.label("present_now");
+        }
+        let p = &mut self.p;
         p.op(SLEEP_UNTIL, &[present_at]);
         p.op(SUB, &[R0, dx1, dx0]);
         p.op(SUB, &[R1, dy1, dy0]);
@@ -1085,7 +1181,88 @@ impl Gen<'_> {
         p.op(MOV, &[dy0, height]);
         p.op(MOV, &[dx1, zero]);
         p.op(MOV, &[dy1, zero]);
+        p.op(MOV, &[entering, zero]);
         p.op(RET, &[]);
+    }
+
+    /// Tile `i` coming in from the top of its rectangle: frames from `present_at` with more and more of it, its
+    /// bottom first, from the frame (which has it whole), the last at the moment the rest is drawn. Uses R0.
+    fn slide_in(&mut self, i: usize) {
+        let Some([x, y, w, h]) = on_panel(self.rect(i)) else { return };
+        let present_at = self.v.present_at;
+        for (j, k) in slide_steps(h, false).into_iter().enumerate() {
+            let [at, sx, sy, dx, dy, kw, kh] =
+                [j as i32 * SLIDE_EVERY as i32, x, y + h - k, x, y, w, k].map(|v| self.ki(v));
+            self.p.op(ADD, &[R0, present_at, at]);
+            self.p.op(SLEEP_UNTIL, &[R0]);
+            self.p.op(DRAW, &[W_FRAME, W_STRIDE, sx, sy, dx, dy, kw, kh]);
+        }
+        let last = self.k((SLIDE_FRAMES - 1) * SLIDE_EVERY);
+        self.p.op(ADD, &[R0, present_at, last]);
+        self.p.op(SLEEP_UNTIL, &[R0]);
+    }
+
+    /// Tile `i` brighter and brighter: frames from `present_at`, each it dimmed to that level in the frame (`BLIT` onto
+    /// itself scales every pixel by level / 15) and drawn again whole for the next, the last at the moment the rest
+    /// is drawn.
+    fn fade_in(&mut self, i: usize) {
+        let Some([x, y, w, h]) = on_panel(self.rect(i)) else { return };
+        let (present_at, draw) = (self.v.present_at, self.t[i].draw);
+        for (j, &level) in FADE_IN.iter().enumerate() {
+            let at = self.k(j as u32 * FADE_EVERY);
+            self.p.op(ADD, &[R0, present_at, at]);
+            self.p.op(SLEEP_UNTIL, &[R0]);
+            self.dim(x, y, w, h, level);
+            self.p.draw_k(x, y, w, h);
+            self.p.jump(CALL, draw);
+        }
+        let last = self.k(FADE_IN.len() as u32 * FADE_EVERY);
+        self.p.op(ADD, &[R0, present_at, last]);
+        self.p.op(SLEEP_UNTIL, &[R0]);
+    }
+
+    /// Tile `i` dimmer and dimmer: frames from `anim_at`, each dimming it in the frame a step more, before what's under
+    /// it is drawn. Uses R2.
+    fn fade_out(&mut self, i: usize) {
+        let Some([x, y, w, h]) = on_panel(self.rect(i)) else { return };
+        let anim_at = self.v.anim_at;
+        let mut was = 15;
+        for (j, &level) in FADE_OUT.iter().enumerate() {
+            let at = self.k((j as u32 + 1) * FADE_EVERY);
+            self.p.op(ADD, &[R2, anim_at, at]);
+            self.p.op(SLEEP_UNTIL, &[R2]);
+            // From `was` to `level` of the whole: by level / was.
+            self.dim(x, y, w, h, ((15 * level as u32 + was / 2) / was) as u8);
+            self.p.draw_k(x, y, w, h);
+            was = level as u32;
+        }
+    }
+
+    /// The frame's x, y, w, h times `level` / 15, in place.
+    fn dim(&mut self, x: i32, y: i32, w: i32, h: i32, level: u8) {
+        let [kx, ky, kw, kh, copy, k_level] = [x, y, w, h, 0, level as i32].map(|v| self.ki(v));
+        self.p.op(BLIT, &[W_FRAME, W_STRIDE, kx, ky, W_FRAME, W_STRIDE, kx, ky, kw, kh, copy, k_level]);
+    }
+
+    /// Tile `i` going out of the bottom of its rectangle: frames from `anim_at` moving it down in the frame and
+    /// clearing above it, before what's under it is drawn. Uses R2.
+    fn slide_out(&mut self, i: usize) {
+        let Some([x, y, w, h]) = on_panel(self.rect(i)) else { return };
+        let anim_at = self.v.anim_at;
+        let mut was = 0;
+        for (j, k) in slide_steps(h, true).into_iter().enumerate() {
+            let at = self.k((j as u32 + 1) * SLIDE_EVERY);
+            self.p.op(ADD, &[R2, anim_at, at]);
+            self.p.op(SLEEP_UNTIL, &[R2]);
+            if k > was {
+                // Rows was..h-k+was of it, down to k, then the strip it left cleared.
+                let [sx, sy, dy, kw, kh, copy, full] = [x, y + was, y + k, w, h - k, 0, 15].map(|v| self.ki(v));
+                self.p.op(BLIT, &[W_FRAME, W_STRIDE, sx, sy, W_FRAME, W_STRIDE, sx, dy, kw, kh, copy, full]);
+                self.p.fill_k(x, y + was, w, k - was, 0);
+                self.p.draw_k(x, y, w, h);
+            }
+            was = k;
+        }
     }
 
     /// The Mac's time and tiles, those whose generation changed. `updated` gets the tiles taken.
@@ -1265,8 +1442,26 @@ impl Gen<'_> {
         } else {
             p.op(DIVU, &[shown, sod, k60]);
         }
-        let [cx, base, n, level] = [x, self.baseline(i, top), chars, tile.level as i32].map(|v| self.ki(v));
-        self.glyphs(i, s, cx, base, b, n, level);
+        let [base, level] = [self.baseline(i, top), tile.level as i32].map(|v| self.ki(v));
+        if tile.h24 {
+            let [cx, n] = [x, chars].map(|v| self.ki(v));
+            self.glyphs(i, s, cx, base, b, n, level);
+            return;
+        }
+        // Before 10 o'clock the hour's first character is a space: left out, and what's left aligned as it is.
+        let [n, one, space, after] = [chars, 1, glyph(' ') as i32, buf as i32 + 1].map(|v| self.ki(v));
+        let whole = self.p.fresh("clock_whole");
+        let p = &mut self.p;
+        p.op(MOV, &[R6, n]);
+        p.op(MOV, &[R5, b]);
+        p.op(LD8, &[R4, b, zero]);
+        p.branch(BNE, R4, space, whole);
+        p.op(SUB, &[R6, R6, one]);
+        p.op(MOV, &[R5, after]);
+        p.label(whole);
+        let [ix, _, iw, _] = self.inner(i);
+        self.line_x(i, R1, R6, s, tile.align, ix, iw);
+        self.glyphs(i, s, R1, base, R5, R6, level);
     }
 
     fn date(&mut self, i: usize) {
@@ -1454,10 +1649,13 @@ impl Gen<'_> {
             let base = self.ki(row_top + m.ascent);
             self.p.op(LD8, &[R0, k_lens, index]);
             self.p.branch(BEQ, R0, zero, skip);
-            if icons {
-                self.icon(i, IconSet::Category, m.height() as u32, Pick::Line(first + j), ix, row_top);
-            }
+            // The text aligned in what's left after the icon's room, the icon just before it, so they align together.
             self.line_x(i, R1, R0, scale, align, ix + indent, iw - indent);
+            if icons {
+                let k_indent = self.ki(indent);
+                self.p.op(SUB, &[R2, R1, k_indent]);
+                self.icon_at(i, IconSet::Category, m.height() as u32, Pick::Line(first + j), R2, row_top);
+            }
             self.glyphs(i, scale, R1, base, text, R0, level);
             self.p.label(skip);
         }
@@ -1481,16 +1679,51 @@ impl Gen<'_> {
         let plan = self.geo.plans[i].clone();
         let tile = self.layout.tiles[i].clone();
         let [ix, iy, iw, ih] = self.inner(i);
+        let align = tile.align;
+        // The counter: the last line, at the right end of the first row, which aligns in the rest.
+        let badge = self.map.tiles[i].lines.len() - 1;
+        let first_scale = if plan.title_scale > 0 { plan.title_scale } else { plan.scale };
+        let first = (ix, iw - BADGE_COLS as i32 * self.metrics(i, first_scale).advance);
         if tile.single_line {
             let top = iy + (ih - self.metrics(i, plan.scale).height()) / 2;
-            self.lines(i, 0, 1, plan.scale, top, tile.align, tile.icon, None);
+            self.first_row(i, plan.scale, top, tile.icon, badge, first);
+            self.lines(i, badge, 1, plan.scale, top, Align::Right, false, None);
+            return;
+        }
+        // No title line: the text from the top, the icon before its first line.
+        if plan.title_scale == 0 {
+            let icons = plan.icon > 0;
+            self.first_row(i, plan.scale, iy, icons, badge, first);
+            let pitch = self.metrics(i, plan.scale).pitch;
+            self.lines(i, 1, plan.rows - 1, plan.scale, iy + pitch, align, icons, None);
+            self.lines(i, badge, 1, plan.scale, iy, Align::Right, false, None);
             return;
         }
         // The title, a rule halfway down the gap under it, then the body.
         let t = self.metrics(i, plan.title_scale);
-        self.lines(i, 0, 1, plan.title_scale, iy, Align::Left, tile.icon, None);
+        self.first_row(i, plan.title_scale, iy, tile.icon, badge, first);
+        self.lines(i, badge, 1, plan.title_scale, iy, Align::Right, false, None);
         self.p.fill_k(ix, iy + t.height() + t.gap() / 2 + 1, iw, 1, RULE_LEVEL);
-        self.lines(i, 1, plan.rows, plan.scale, iy + t.height() + t.gap() + 3, tile.align, false, None);
+        self.lines(i, 1, plan.rows, plan.scale, iy + t.height() + t.gap() + 3, align, false, None);
+    }
+
+    /// A notification's first row: aligned across the whole width, or with a counter showing (line `badge` not
+    /// empty), in what it leaves (`narrow`, x and w).
+    fn first_row(&mut self, i: usize, scale: u8, top: i32, icons: bool, badge: usize, narrow: (i32, i32)) {
+        let align = self.layout.tiles[i].align;
+        if align == Align::Left {
+            self.lines(i, 0, 1, scale, top, align, icons, Some(narrow));
+            return;
+        }
+        let (counted, done) = (self.p.fresh("counted_row"), self.p.fresh("first_row"));
+        let [zero, lens, index] = [0, self.map.tiles[i].lens, badge as u32].map(|v| self.k(v));
+        self.p.op(LD8, &[R0, lens, index]);
+        self.p.branch(BNE, R0, zero, counted);
+        self.lines(i, 0, 1, scale, top, align, icons, None);
+        self.p.jump(JMP, done);
+        self.p.label(counted);
+        self.lines(i, 0, 1, scale, top, align, icons, Some(narrow));
+        self.p.label(done);
     }
 
     /// The next turn: its arrow, then the distance over the street, or the two on one line.
@@ -1680,6 +1913,11 @@ impl Shell {
     /// `text` for tile `i`, as the Mac sends it: for a notification "TITLE: text" (or just text, titled "Note") with
     /// `icon` (a category), wrapped to fit, or on one line; for a text tile, wrapped. Empty for no text.
     pub fn note(&self, i: usize, text: &str, icon: u8) -> TileData {
+        self.note_waiting(i, text, icon, 0)
+    }
+
+    /// The same, a notification with `waiting` more after it: "+3" at the right of its first line.
+    pub fn note_waiting(&self, i: usize, text: &str, icon: u8, waiting: usize) -> TileData {
         let (tile, plan) = (&self.layout.tiles[i], &self.geo.plans[i]);
         let text = text.trim();
         if text.is_empty() {
@@ -1694,15 +1932,21 @@ impl Shell {
                     }
                     _ => ("", text),
                 };
-                let lines = if tile.single_line {
-                    let line = if title.is_empty() { body.to_string() } else { format!("{title}: {body}") };
+                let line = if title.is_empty() { body.to_string() } else { format!("{title}: {body}") };
+                let first = plan.cols.saturating_sub(BADGE_COLS);
+                let mut lines = if tile.single_line {
                     vec![one_line(&line, plan.cols, emoji)]
+                } else if plan.title_scale == 0 {
+                    super::layout::wrap_first(&line, first, plan.cols, plan.rows, emoji)
                 } else {
                     let title = if title.is_empty() { "Note" } else { title };
                     let mut lines = vec![one_line(title, plan.title_cols, tile.emoji(plan.title_scale))];
                     lines.extend(super::layout::wrap(body, plan.cols, plan.rows, emoji));
                     lines
                 };
+                // The counter is the last line.
+                lines.resize(capacities(tile, plan).len() - 1, String::new());
+                lines.push(if waiting > 0 { format!("+{}", waiting.min(999)) } else { String::new() });
                 TileData { lines, icons: vec![icon], ..TileData::default() }
             }
             Kind::Text => {
@@ -1920,7 +2164,8 @@ mod tests {
         assert_eq!(shell.steps(123_456).lines, ["123456"]);
         let n = shell.of(Kind::Notification)[0];
         let note = shell.note(n, "Messages: Lunch at 12:30?", 1);
-        assert_eq!(note.lines, ["Messages", "Lunch at 12:30?"]);
+        assert_eq!(note.lines[..2], ["Messages", "Lunch at 12:30?"]);
+        assert_eq!(note.lines.last().unwrap(), "");
         assert_eq!(note.icons, [1]);
         let list = shell.of(Kind::NotificationList)[0];
         let rows = shell.list(list, &[(1, "Alex: hi".into()), (2, "x".repeat(100))]);
@@ -2109,6 +2354,151 @@ mod tests {
         assert_eq!(drawn_text(&sim, 1, "mac_battery")[..4].to_string(), " 76%");
         assert!(lit(&sim, 1, sim.shell.layout.tiles[steps].rect));
         assert!(lit(&sim, 1, sim.shell.layout.tiles[heart].rect));
+    }
+
+    /// The first and last lit rows of x, y, w, h on arm `arm`'s panel.
+    fn lit_rows(sim: &SimShell, arm: usize, [x, y, w, h]: [i32; 4]) -> Option<(i32, i32)> {
+        let rows: Vec<i32> = (y..y + h).filter(|&r| lit(sim, arm, [x, r, w, 1])).collect();
+        Some((*rows.first()?, *rows.last()?))
+    }
+
+    #[test]
+    fn a_notification_slides_in_and_out() {
+        // A tap at 4 s dismisses it.
+        let mut sim = sim(Script::still(10.0).touch(4.0, Side::Right, 1));
+        sim.run(1.0).unwrap();
+        let note = sim.tile("notification");
+        let [x, y, w, h] = sim.shell.layout.tiles[note].rect;
+        sim.send(note, "Messages: Lunch at 12:30?", 0.0);
+        // Shown from 1.7 s (0.3 s to act on it, 0.4 to draw it), sliding in for a quarter second: a little way
+        // in, its frame's bottom edge is near the top of its rectangle, and the clock under it still shows.
+        sim.run(0.72).unwrap();
+        for arm in 0..2 {
+            let (_, bottom) = lit_rows(&sim, arm, [x, y, w, h]).unwrap();
+            assert!(bottom < y + h / 2, "arm {arm}: its bottom edge at {bottom}, coming in");
+        }
+        sim.run(0.5).unwrap();
+        for arm in 0..2 {
+            assert_eq!(lit_rows(&sim, arm, [x, y, w, h]).unwrap(), (y, y + h - 1), "arm {arm}: in");
+        }
+        // Halfway out, its top edge is well down and nothing is above it; then the clock is back.
+        sim.run(4.36 - sim.world.seconds()).unwrap();
+        for arm in 0..2 {
+            let (top, _) = lit_rows(&sim, arm, [x, y, w, h]).unwrap();
+            assert!(top > y + 10 && top < y + h - 10, "arm {arm}: its top edge at {top}, going");
+        }
+        sim.run(0.5).unwrap();
+        for arm in 0..2 {
+            assert_eq!(sim.visible(arm) & 1, 0);
+            assert!(lit(&sim, arm, [16, 16, 288, 40]), "arm {arm}: the clock is back");
+        }
+    }
+
+    #[test]
+    fn centred_text_is_in_the_middle() {
+        // 8:14:30 PM, its hour one digit; the clock and the notification centred, no counter showing.
+        let mut layout = Layout::default();
+        layout.tiles[0].align = Align::Center;
+        let clock = layout.tiles.iter().position(|t| t.name == "clock").unwrap();
+        layout.tiles[clock].align = Align::Center;
+        layout.tiles[0].rect = [16, 100, 608, 200];
+        let mut sim = SimShell::new(layout, Script::still(10.0), &BOTH, 10, 20 * 3600 + 14 * 60 + 29).unwrap();
+        sim.run(1.0).unwrap();
+        let note = sim.tile("notification");
+        sim.send(note, "Messages: Lunch at 12:30?", 0.0);
+        sim.run(1.5).unwrap();
+        // The space either side of what's lit in a band of a rectangle.
+        let margins = |sim: &SimShell, [x, y, w, h]: [i32; 4]| {
+            let panel = sim.world.arms[1].panel().unwrap();
+            let lit_at = |c: i32| (y..y + h).any(|r| panel[(r * 640 + c) as usize] != 0);
+            let first = (x..x + w).find(|&c| lit_at(c)).unwrap();
+            let last = (x..x + w).rev().find(|&c| lit_at(c)).unwrap();
+            (first - x, x + w - 1 - last)
+        };
+        let (left, right) = margins(&sim, sim.shell.geo.plans[clock].inner);
+        assert!((left - right).abs() <= 6, "the clock: {left} px left of it, {right} right");
+        let [x, y, w, _] = sim.shell.geo.plans[note].inner;
+        let (left, right) = margins(&sim, [x, y, w, 24]);
+        assert!((left - right).abs() <= 6, "the header: {left} px left of it, {right} right");
+    }
+
+    #[test]
+    fn a_centred_notification_header_with_more_waiting() {
+        let mut layout = Layout::default();
+        layout.tiles[0].align = Align::Center;
+        let mut sim = SimShell::new(layout, Script::still(10.0), &BOTH, 10, ELEVEN).unwrap();
+        sim.run(1.0).unwrap();
+        let note = sim.tile("notification");
+        let data = sim.shell.note_waiting(note, "Messages: Lunch at 12:30?", 1, 2);
+        assert_eq!(data.lines.last().unwrap(), "+2");
+        sim.send_data(note, data);
+        sim.send_on(note);
+        sim.run(1.5).unwrap();
+        // 596 px inside from x 22; the title row 24 px high from y 22, the counter in its last 4 characters (96 px).
+        let [x, y, w, _] = sim.shell.geo.plans[note].inner;
+        for arm in 0..2 {
+            assert!(!lit(&sim, arm, [x, y, 30, 24]), "arm {arm}: the icon moved in with the title");
+            assert!(lit(&sim, arm, [x + w / 2 - 100, y, 200, 24]), "arm {arm}: the title in the middle");
+            assert!(lit(&sim, arm, [x + w - 96, y, 96, 24]), "arm {arm}: the counter");
+        }
+    }
+
+    #[test]
+    fn a_notification_fades_in_and_out() {
+        let mut layout = Layout::default();
+        layout.tiles[0].transition = Some(Transition::Fade);
+        let mut sim = SimShell::new(layout, Script::still(10.0).touch(4.0, Side::Right, 1), &BOTH, 10, ELEVEN).unwrap();
+        sim.run(1.0).unwrap();
+        let note = sim.tile("notification");
+        let [x, y, w, h] = sim.shell.layout.tiles[note].rect;
+        // The brightest pixel of the notification's rectangle on each arm.
+        let brightest = |sim: &SimShell| -> Vec<u8> {
+            (0..2)
+                .map(|arm| {
+                    let panel = sim.world.arms[arm].panel().unwrap();
+                    (y..y + h).flat_map(|r| (x..x + w).map(move |c| panel[(r * 640 + c) as usize])).max().unwrap()
+                })
+                .collect()
+        };
+        sim.send(note, "Messages: Lunch at 12:30?", 0.0);
+        // Shown from 1.7 s at 4 of 15, then 8, 12, and whole at 1.94 s.
+        sim.run(0.72).unwrap();
+        assert_eq!(brightest(&sim), [4, 4]);
+        sim.run(0.1).unwrap();
+        assert_eq!(brightest(&sim), [8, 8]);
+        sim.run(0.2).unwrap();
+        assert_eq!(brightest(&sim), [15, 15]);
+        // Tapped away: 11, 7, 3 from 4.28 s, then the clock back.
+        sim.run(4.32 - sim.world.seconds()).unwrap();
+        assert!(brightest(&sim).iter().all(|&b| (10..=11).contains(&b)), "{:?}", brightest(&sim));
+        sim.run(0.08).unwrap();
+        assert!(brightest(&sim).iter().all(|&b| (6..=7).contains(&b)), "{:?}", brightest(&sim));
+        sim.run(0.4).unwrap();
+        for arm in 0..2 {
+            assert_eq!(sim.visible(arm) & 1, 0);
+            assert!(lit(&sim, arm, [16, 16, 288, 40]), "arm {arm}: the clock is back");
+        }
+    }
+
+    #[test]
+    fn draws_a_notification_without_a_title_line() {
+        // The default notification with only its icon: "Alex: lunch?" from its top line, the icon before it.
+        let mut layout = Layout::default();
+        layout.tiles[0].header = super::super::layout::Header::Icon;
+        let mut sim = SimShell::new(layout, Script::still(10.0), &BOTH, 10, ELEVEN).unwrap();
+        sim.run(1.0).unwrap();
+        let note = sim.tile("notification");
+        let data = sim.shell.note(note, "Alex: lunch at 12:30? I can book the table by the river.", 1);
+        assert_eq!(data.lines[0], "Alex: lunch at 12:30? I can book");
+        sim.send_data(note, data);
+        sim.send_on(note);
+        sim.run(1.5).unwrap();
+        let [x, y, _, _] = sim.shell.geo.plans[note].inner;
+        for arm in 0..2 {
+            assert_eq!(sim.visible(arm) & 1, 1);
+            // The icon (16 px) and the text on the first line.
+            assert!(lit(&sim, arm, [x, y, 16, 16]) && lit(&sim, arm, [x + 24, y, 100, 16]));
+        }
     }
 
     #[test]

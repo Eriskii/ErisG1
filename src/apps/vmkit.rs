@@ -76,6 +76,17 @@ impl Program {
         CODE + self.code.len() as u32
     }
 
+    /// How much of each area it takes, bytes, and how much each has: code, constants, variables, buffers.
+    pub fn usage(&self) -> [(u32, u32); 4] {
+        let data_end = self.data.iter().map(|(at, bytes)| at + bytes.len() as u32).max().unwrap_or(DATA);
+        [
+            (self.code.len() as u32, TABLE - CODE),
+            (self.pool.len() as u32, VARS - POOL),
+            (4 * self.inits.len() as u32, DATA - VARS),
+            (data_end - DATA, CODE - DATA),
+        ]
+    }
+
     /// Host code that puts it in the arena, `start` being the arm's clock at the shared start moment.
     pub fn writes(&self, start: u32) -> Vec<Vec<u8>> {
         let mut w = v5::upload(POOL, &self.pool, 240);

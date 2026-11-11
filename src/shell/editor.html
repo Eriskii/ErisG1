@@ -317,7 +317,7 @@ const SCENE_DEFAULT_TILT = { down: -25, up: 20 };
 
 // The kinds of tile: what each is, where a new one goes, and its own options.
 const KINDS = {
-  notification: { label: "Notification", about: "Pops up with an icon, a title and text; a tap dismisses it", rect: [16, 16, 608, 200], fields: ["icon", "single_line", "mirror"] },
+  notification: { label: "Notification", about: "Pops up with an icon, a title and text; a tap dismisses it", rect: [16, 16, 608, 200], fields: ["header", "title_size", "icon", "single_line", "mirror"] },
   notification_list: { label: "Notification list", about: "The Mac's notifications, an icon and a line each, as many as fit", rect: [16, 16, 608, 220], fields: ["icon"] },
   clock: { label: "Clock", about: "The time, kept by the glasses", rect: [16, 16, 288, 40], fields: ["seconds", "h24"] },
   date: { label: "Date", about: "Today's date, in any format", rect: [16, 60, 288, 32], fields: ["format"] },
@@ -334,6 +334,8 @@ const CONTENT = new Set(["notification", "text", "navigation"]);
 const FIELDS = {
   icon: { type: "check", label: "Icon" },
   single_line: { type: "check", label: "On one line" },
+  header: { type: "select", label: "Above the text", options: [["title", "Icon and title"], ["icon", "Icon only"], ["none", "Nothing"]] },
+  title_size: { type: "size", label: "Title size" },
   mirror: { type: "check", label: "The Mac's notifications pop up here" },
   seconds: { type: "check", label: "Seconds" },
   h24: { type: "check", label: "24-hour" },
@@ -392,7 +394,7 @@ function newTile(kind) {
     name, kind, rect: KINDS[kind].rect.slice(), on: !CONTENT.has(kind),
     scenes: popup ? ["level", "down", "up"] : [scene],
     size: 0, align: "left", level: 15, border: popup, dismiss: popup, timeout: popup ? 8 : 0,
-    icon: true, seconds: true, h24: false, format: "", both: false, single_line: false, mirror: true,
+    icon: true, seconds: true, h24: false, format: "", both: false, single_line: false, mirror: true, header: "title", title_size: 0, transition: popup ? "slide" : "none",
     temp: true, humidity: true, unit: "auto", label: true, shape: "square", text: "", depth: null, font: "pixel", preview: CONTENT.has(kind),
   };
 }
@@ -599,6 +601,7 @@ function fitsText(t, p) {
   const face = faceOf(t);
   const px = (s) => face.px * s + " px" + (["notification", "notification_list", "text"].includes(t.kind) && face.emoji.includes(s) ? " with emoji" : "");
   if (t.kind === "notification" && t.single_line) return `one line of ${p.cols} characters at ${px(p.scale)}`;
+  if (t.kind === "notification" && !p.title_scale) return `${p.rows} lines of ${p.cols} characters at ${px(p.scale)}${p.icon ? ", the icon before the first" : ""}`;
   if (t.kind === "notification") return `title ${p.title_cols} characters at ${px(p.title_scale)}; ${p.rows} lines of ${p.cols} at ${px(p.scale)}`;
   if (t.kind === "notification_list") return `${p.rows} notifications of ${p.cols} characters at ${px(p.scale)}`;
   if (t.kind === "text") return `${p.rows} line${p.rows > 1 ? "s" : ""} of ${p.cols} characters at ${px(p.scale)}`;
@@ -619,6 +622,15 @@ function setField(el, t) {
 
 function fieldHtml(k, t) {
   const f = FIELDS[k];
+  // The title's size, only with a title (and not on one line): auto (one up from the text) or the font's sizes.
+  if (f.type === "size") {
+    if ((t.header || "title") !== "title" || t.single_line) return "";
+    const face = faceOf(t);
+    const sizes = Array.from({ length: face.most + 1 }, (_, s) => s)
+      .map((s) => `<option value="${s}" ${(t[k] || 0) === s ? "selected" : ""}>${s === 0 ? "auto" : face.px * s + " px"}</option>`).join("");
+    return `<label>${esc(f.label)}<select data-k="${k}">${sizes}</select></label>`;
+  }
+  if (f.type === "select" && k === "header" && t.single_line) return "";
   if (f.type === "check") return `<label class="check"><input type="checkbox" data-k="${k}" ${t[k] ? "checked" : ""}>${esc(f.label)}</label>`;
   if (f.type === "select") return `<label>${esc(f.label)}<select data-k="${k}">${f.options.map(([v, l]) => `<option value="${v}" ${t[k] === v ? "selected" : ""}>${esc(l)}</option>`).join("")}</select></label>`;
   if (f.type === "textarea") return `<label class="wide">${esc(f.label)}<textarea data-k="${k}">${esc(t[k])}</textarea></label>`;
@@ -651,6 +663,7 @@ function formHtml(t) {
     </div>
     <div class="row3"><span>Scenes</span>${SCENES.map((s) => `<label class="check"><input type="checkbox" data-k="scene:${s.id}" ${sc.includes(s.id) ? "checked" : ""}>${esc(s.label.replace("Looking ", ""))}</label>`).join("")}</div>
     ${check("on", "On from the start")}
+    <label>Comes and goes<select data-k="transition">${[["none", "At once"], ["slide", "Slides in and out"], ["fade", "Fades in and out"]].map(([v, l]) => `<option value="${v}" ${t.transition === v ? "selected" : ""}>${l}</option>`).join("")}</select></label>
     ${CONTENT.has(t.kind) ? check("preview", "On in this preview") : "<span></span>"}
     <label title="Departure Mono reads better small, and has emoji in messages at 11 and 22 px">Font<select data-k="font">${fonts}</select></label>
     <label>Text size<select data-k="size">${sizes}</select></label>
@@ -676,7 +689,7 @@ function edit(el) {
     t.scenes = SCENES.map((x) => x.id).filter((x) => set.has(x));
   } else if (el.type === "checkbox") {
     t[k] = el.checked;
-  } else if (["size", "level"].includes(k)) {
+  } else if (["size", "level", "title_size"].includes(k)) {
     t[k] = Number(el.value);
   } else if (k === "timeout") {
     t[k] = Math.max(0, Number(el.value) || 0);
@@ -691,7 +704,10 @@ function edit(el) {
     formFor = null;
   }
   // Sizes count in the font's own steps: back to auto, and the sizes listed again.
+  // What the form shows depends on these.
+  if (k === "header" || k === "single_line") formFor = null;
   if (k === "font") {
+    t.title_size = 0;
     t.size = 0;
     formFor = null;
   }
@@ -996,6 +1012,7 @@ $("revert").addEventListener("click", () => load("/api/layout"));
 $("default").addEventListener("click", async () => {
   const r = await api("/api/default");
   layout = r.layout;
+  settle(layout);
   selected = -1;
   visible = [];
   syncGlobals();
@@ -1014,6 +1031,15 @@ $("demo-route").addEventListener("click", async () => {
   say(layout.tiles.some((t) => t.kind === "navigation") ? "A demo route for 20 seconds" : "Add a navigation tile first", "");
 });
 
+// What a tile leaves to its kind, written out: its scenes, how it comes and goes.
+function settle(layout) {
+  for (const t of layout.tiles) {
+    t.scenes = scenesOf(t);
+    if (t.transition == null) t.transition = t.slide != null ? (t.slide ? "slide" : "none") : t.kind === "notification" ? "slide" : "none";
+    delete t.slide;
+  }
+}
+
 function syncGlobals() {
   $("depth").value = String(layout.depth);
   if (!$("depth").value) $("depth").value = "0";
@@ -1031,7 +1057,7 @@ function syncGlobals() {
 async function load(path) {
   const r = await api(path);
   layout = r.layout;
-  for (const t of layout.tiles) t.scenes = scenesOf(t);
+  settle(layout);
   saved = JSON.stringify(layout);
   if (r.file) $("revert").title = "Back to the saved layout, " + r.file;
   selected = -1;
